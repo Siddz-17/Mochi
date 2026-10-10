@@ -31,7 +31,7 @@ if (typeof electronBin !== 'string' || electronBin.length === 0) {
 // happens in the native delegate before Node boots). Pass it when spawning.
 const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 const noSandboxArgs = isRoot ? ['--no-sandbox'] : [];
-const useXvfb = !process.env.DISPLAY;
+const useXvfb = process.platform !== 'win32' && !process.env.DISPLAY;
 const cmd = useXvfb ? 'xvfb-run' : electronBin;
 const args = useXvfb
   ? ['-a', electronBin, ...noSandboxArgs, '.', '--smoke']

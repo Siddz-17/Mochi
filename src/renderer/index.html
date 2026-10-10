@@ -1,4 +1,3 @@
-<!-- boot.js is written by the build coordinator; do not add inline logic here -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -14,26 +13,29 @@
 </head>
 <body>
   <div id="stage">
-    <canvas id="dog-canvas"></canvas>
+    <canvas id="dog-canvas" width="128" height="128"></canvas>
     <div id="effects-layer"></div>
   </div>
 
   <div id="panel" class="hidden">
+    <div id="panel-header">
+      <h3>🐕 Mochi</h3>
+      <div>
+        <button type="button" id="chat-clear" aria-label="Clear chat" title="Clear chat">🗑</button>
+        <button type="button" id="chat-close" aria-label="Close" title="Close">✕</button>
+      </div>
+    </div>
     <div id="messages"></div>
-    <div id="quick-actions"></div>
     <form id="chat-form">
       <input id="chat-input" type="text" autocomplete="off" spellcheck="false" placeholder="Talk to Mochi…" />
-      <button type="submit" id="chat-send" aria-label="Send">&#x27A4;</button>
+      <button type="submit" id="chat-send" aria-label="Send">➤</button>
     </form>
-    <div id="approval-area"></div>
     <div id="status-line"></div>
   </div>
 
   <div id="settings" class="hidden">
     <div id="settings-form"></div>
   </div>
-
-  <div id="panel-badge" class="hidden"></div>
 
   <script type="module" src="./boot.js"></script>
 </body>

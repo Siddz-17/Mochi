@@ -6,9 +6,9 @@
  * Owns: BrowserWindow (transparent, frameless, always-on-top), tray icon,
  * global shortcut, config persistence (mochi.config.json), window position
  * memory (userData/position.json), login-item toggle, --smoke test mode,
- * and the full mochi:* IPC bridge consumed via electron/preload.cjs.
+ * and the minimal mochi:* IPC bridge consumed via electron/preload.cjs.
  *
- * No network calls, no telemetry. No AI provider / API key / secret handling.
+ * No network calls, no telemetry.
  */
 
 const path = require('node:path');
@@ -30,11 +30,50 @@ const IS_ROOT =
   typeof process.getuid === 'function' && process.getuid() === 0;
 
 // Chromium refuses to start as root without this (CI / containers).
-// Best-effort fallback: the native startup check runs before this JS loads,
-// so launchers should ALSO pass --no-sandbox on the real command line
-// (scripts/smoke.cjs does this automatically when uid is 0).
 if (IS_ROOT) {
   app.commandLine.appendSwitch('no-sandbox');
+}
+
+// Transparent windows can render as fully invisible with some Windows GPU
+// drivers. Launch with `npm start -- --no-gpu` to rule that out.
+if (process.argv.includes('--no-gpu')) {
+  app.disableHardwareAcceleration();
+}
+
+// Log file so problems are visible even when the window is not:
+// %APPDATA%\mochi\mochi.log
+function logLine(msg) {
+  try {
+    fs.appendFileSync(
+      path.join(app.getPath('userData'), 'mochi.log'),
+      `[${new Date().toISOString()}] ${msg}\n`
+    );
+  } catch {
+    /* logging must never crash the app */
+  }
+}
+
+if (!SMOKE_MODE) {
+  const gotTheLock = app.requestSingleInstanceLock();
+  if (!gotTheLock) {
+    console.log('[mochi] another instance is already running; exiting.');
+    app.quit();
+    process.exit(0);
+  } else {
+    // Launching again (e.g. a stale/invisible copy is already running) should
+    // REVEAL the existing dog instead of silently doing nothing.
+    app.on('second-instance', () => {
+      if (win) {
+        forceOut();
+        const p = defaultPosition();
+        moveWindow(p.x, p.y);
+        if (!win.isVisible()) win.show();
+        win.setAlwaysOnTop(true);
+        win.moveTop();
+        win.webContents.send('mochi:toggle-panel');
+      }
+    });
+  }
 }
 
 /* ------------------------------------------------------------------ config */
@@ -44,15 +83,14 @@ const CONFIG_PATH = path.join(__dirname, '..', 'mochi.config.json');
 const DEFAULT_CONFIG = {
   provider: 'mock',
   scale: 4,
-  calmMode: false,
-  soundsEnabled: false,
   userName: '',
-  workingFolder: '',
-  openAtLogin: false,
+  wanderEnabled: true,
+  homeDisplayId: null,
+  dockEnabled: true,
+  dockIdleSeconds: 20,
+  dockPeekPx: 44,
+  calmMode: false,
   sleepAfterMinutes: 5,
-  peekMode: false,
-  pomodoro: { enabled: false, focusMinutes: 25, breakMinutes: 5 },
-  reminders: { stretch: true, water: true, intervalMinutes: 45 },
 };
 
 function isPlainObject(v) {
@@ -76,7 +114,6 @@ function loadConfig() {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
     return deepMerge(DEFAULT_CONFIG, JSON.parse(raw));
   } catch {
-    // Missing or corrupt config: fall back to defaults (deep copy).
     return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   }
 }
@@ -112,13 +149,162 @@ function loadPosition() {
       return { x: Math.round(p.x), y: Math.round(p.y) };
     }
   } catch {
-    // No saved position yet — caller falls back to the default placement.
+    // No saved position yet
   }
   return null;
 }
 
-// Ignore a saved position that would strand the window off every display
-// (e.g. a monitor was unplugged since the last session).
+/* ------------------------------------------------------- screen geometry
+ * The window is a fixed 560x480 transparent box; the dog sits in its
+ * bottom-right corner and the chat panel opens up/left of the dog.
+ * ALL window moves are clamped here, in the main process, so the dog can
+ * never leave the visible area no matter what the renderer asks for.
+ * Only ONE display is used: the "home" display (primary, or the one chosen
+ * from the tray menu). This is what fixes "invisible on the laptop screen".
+ */
+const WIN_W = 560;
+const WIN_H = 480;
+const INSET = 16; // CSS: #stage right/bottom
+const PANEL_W = 320;
+const PANEL_H = 310; // CSS max-height
+const PANEL_GAP = 24;
+let panelOpen = false;
+let docked = false; // true while hidden at the left edge, peeking
+let glideTimer = null;
+let glideResolve = null;
+
+function layout() {
+  const sc = Math.min(6, Math.max(2, Math.round(Number(config.scale)) || 4));
+  const dog = 32 * sc;
+  const dogR = WIN_W - INSET;
+  const dogB = WIN_H - INSET;
+  return {
+    dogL: dogR - dog,
+    dogR,
+    dogT: dogB - dog,
+    dogB,
+    panelL: dogR - PANEL_W,
+    panelT: WIN_H - (dog + PANEL_GAP) - PANEL_H,
+  };
+}
+
+function homeDisplay() {
+  const all = screen.getAllDisplays();
+  return all.find((d) => d.id === config.homeDisplayId) || screen.getPrimaryDisplay();
+}
+
+// Allowed window x/y range so the DOG (and the panel, when open) stay fully
+// inside the home display's work area (i.e. above the taskbar).
+function posBounds(withPanel) {
+  const wa = homeDisplay().workArea;
+  const L = layout();
+  let minX = wa.x - L.dogL;
+  let maxX = wa.x + wa.width - L.dogR;
+  let minY = wa.y - L.dogT;
+  let maxY = wa.y + wa.height - L.dogB;
+  if (withPanel) {
+    minX = Math.max(minX, wa.x - L.panelL);
+    minY = Math.max(minY, wa.y - L.panelT);
+  }
+  if (minX > maxX) minX = maxX;
+  if (minY > maxY) minY = maxY;
+  return { minX, maxX, minY, maxY };
+}
+
+function clampPos(x, y, withPanel = panelOpen) {
+  const b = posBounds(withPanel);
+  return {
+    x: Math.round(Math.min(b.maxX, Math.max(b.minX, Number(x) || 0))),
+    y: Math.round(Math.min(b.maxY, Math.max(b.minY, Number(y) || 0))),
+  };
+}
+
+// setBounds (not setPosition) so Windows DPI rounding can never resize the window.
+function moveWindow(x, y) {
+  if (!win || win.isDestroyed()) return null;
+  const p = clampPos(x, y);
+  win.setBounds({ x: p.x, y: p.y, width: WIN_W, height: WIN_H });
+  return p;
+}
+
+// Where the window sits when the dog is hidden at the LEFT edge (only a
+// sliver of the dog shows) and where it sits when popped out.
+function dockGeometry() {
+  const wa = homeDisplay().workArea;
+  const L = layout();
+  const b = posBounds(false);
+  const dogW = L.dogR - L.dogL;
+  const sliver = Math.min(dogW - 8, Math.max(16, Number(config.dockPeekPx) || 44));
+  const cy = win && !win.isDestroyed() ? win.getPosition()[1] : b.maxY;
+  const y = Math.round(Math.min(b.maxY, Math.max(b.minY, cy)));
+  return {
+    peekX: Math.round(wa.x - L.dogL - dogW + sliver),
+    outX: Math.round(wa.x + 24 - L.dogL),
+    y,
+  };
+}
+
+function cancelGlide() {
+  if (glideTimer) {
+    clearInterval(glideTimer);
+    glideTimer = null;
+  }
+  if (glideResolve) {
+    const r = glideResolve;
+    glideResolve = null;
+    r(false);
+  }
+}
+
+// Smooth eased window move (used to walk the dog to / from the left edge).
+// Raw coordinates on purpose: the peek position is partly off-screen.
+function glideTo(ex, ey, ms) {
+  return new Promise((resolve) => {
+    if (!win || win.isDestroyed()) return resolve(false);
+    cancelGlide();
+    const [sx, sy] = win.getPosition();
+    const t0 = Date.now();
+    glideResolve = resolve;
+    glideTimer = setInterval(() => {
+      if (!win || win.isDestroyed()) return cancelGlide();
+      const k = Math.min(1, (Date.now() - t0) / ms);
+      const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+      win.setBounds({
+        x: Math.round(sx + (ex - sx) * e),
+        y: Math.round(sy + (ey - sy) * e),
+        width: WIN_W,
+        height: WIN_H,
+      });
+      if (k >= 1) {
+        clearInterval(glideTimer);
+        glideTimer = null;
+        glideResolve = null;
+        if (!docked) savePositionDebounced(ex, ey);
+        resolve(true);
+      }
+    }, 16);
+  });
+}
+
+// Reset/second-launch/screen-change: bring the dog fully out and tell the renderer.
+function forceOut() {
+  cancelGlide();
+  docked = false;
+  if (win && !win.isDestroyed()) win.webContents.send('mochi:dock-state', { state: 'out' });
+}
+
+function reclampWindow() {
+  if (docked && win && !win.isDestroyed()) {
+    const g = dockGeometry();
+    win.setBounds({ x: g.peekX, y: g.y, width: WIN_W, height: WIN_H });
+    return;
+  }
+  if (!win || win.isDestroyed()) return;
+  const [x, y] = win.getPosition();
+  const p = moveWindow(x, y);
+  if (p) savePositionDebounced(p.x, p.y);
+}
+
 function positionOnScreen(pos) {
   try {
     const display = screen.getDisplayNearestPoint({ x: pos.x, y: pos.y });
@@ -154,8 +340,6 @@ function savePositionDebounced(x, y) {
 
 /* ------------------------------------------- tray icon (pure-JS PNG, zlib) */
 
-// ORIGINAL 16x16 white-dog-face pixel pattern, drawn for this project.
-// '.' = transparent, 'W' = white, 'k' = dark outline (#3a3f4a).
 const DOG_FACE = [
   '................',
   '..kk......kk....',
@@ -214,7 +398,7 @@ function buildTrayPng() {
   for (const line of DOG_FACE) {
     if (line.length !== W) throw new Error('tray pattern row is not 16 chars');
     const row = Buffer.alloc(1 + W * 4);
-    row[0] = 0; // PNG filter: None
+    row[0] = 0;
     for (let x = 0; x < W; x++) {
       const ch = line[x];
       const px = ch === 'W' ? WHITE : ch === 'k' ? INK : CLEAR;
@@ -228,9 +412,8 @@ function buildTrayPng() {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // color type: RGBA
-  // ihdr[10..12] = compression / filter / interlace, all zero
+  ihdr[8] = 8;
+  ihdr[9] = 6;
   const idat = zlib.deflateSync(Buffer.concat(rows));
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -244,21 +427,30 @@ function buildTrayPng() {
 
 let win = null;
 let tray = null;
-let sleeping = false;
 let windowVisible = true;
+
+function defaultPosition() {
+  try {
+    const b = posBounds(false);
+    return clampPos(b.maxX - 24, b.maxY, false); // bottom-right of the home screen
+  } catch {
+    return { x: 100, y: 100 };
+  }
+}
 
 function createWindow() {
   const savedPos = loadPosition();
-  const useSavedPos = savedPos && positionOnScreen(savedPos);
+  const pos = savedPos ? clampPos(savedPos.x, savedPos.y, false) : defaultPosition();
 
   win = new BrowserWindow({
-    width: 560,
-    height: 480,
-    ...(useSavedPos ? { x: savedPos.x, y: savedPos.y } : {}),
+    width: WIN_W,
+    height: WIN_H,
+    x: pos.x,
+    y: pos.y,
     transparent: true,
     frame: false,
     alwaysOnTop: true,
-    skipTaskbar: true,
+    skipTaskbar: false,
     hasShadow: false,
     resizable: false,
     fullscreenable: false,
@@ -275,20 +467,23 @@ function createWindow() {
   win.loadFile(path.join(__dirname, '..', 'src', 'renderer', 'index.html'));
 
   win.once('ready-to-show', () => {
-    win.showInactive(); // never steal focus on launch
+    win.show();
+    win.focus();
+    win.setAlwaysOnTop(true);
+    win.moveTop();
     windowVisible = true;
     refreshTrayMenu();
+    console.log('[mochi] window is visible at:', JSON.stringify(win.getBounds()));
+    logLine('window shown at ' + JSON.stringify(win.getBounds()));
+
     if (SMOKE_MODE) {
       setTimeout(async () => {
-        // Integration probe: verify the renderer boot completed and all
-        // modules were constructed (window.__mochi is set at end of boot.js).
         try {
           const probe = await win.webContents.executeJavaScript(
             `(() => { const m = window.__mochi; return m ? {
               boot: true,
               dog: !!m.dog, panel: !!m.panel, settings: !!m.settings,
-              effects: !!m.effects, pomodoro: !!m.pomodoro,
-              reminders: !!m.reminders, sound: !!m.sound,
+              wander: !!m.wander, effects: !!m.effects,
             } : { boot: false }; })()`,
             true
           );
@@ -320,17 +515,19 @@ function createWindow() {
     refreshTrayMenu();
   });
 
-  if (SMOKE_MODE) {
-    // Surface renderer console warnings/errors on stdout for debugging.
-    win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
-      if (level >= 2) {
-        console.log(`[renderer-console] ${sourceId}:${line} ${message}`);
-      }
-    });
-    win.webContents.on('did-fail-load', (_e, code, desc) => {
-      console.log(`[renderer-load-failed] ${code} ${desc}`);
-    });
-  }
+  win.webContents.on('console-message', (e, level, message, line, sourceId) => {
+    const d = e && typeof e.message === 'string' ? e : { level, message, lineNumber: line, sourceId };
+    const text = `[renderer-console] ${d.sourceId}:${d.lineNumber} ${d.message}`;
+    console.log(text);
+    logLine(text);
+  });
+  win.webContents.on('did-fail-load', (_e, code, desc) => {
+    console.log(`[renderer-load-failed] ${code} ${desc}`);
+    logLine(`[renderer-load-failed] ${code} ${desc}`);
+  });
+  win.webContents.on('render-process-gone', (_e, details) => {
+    logLine(`[render-process-gone] ${JSON.stringify(details)}`);
+  });
 }
 
 /* -------------------------------------------------------------------- tray */
@@ -343,17 +540,50 @@ function refreshTrayMenu() {
       click: () => {
         if (!win) return;
         if (win.isVisible()) win.hide();
-        else win.showInactive(); // re-showing never steals focus either
+        else win.showInactive();
       },
     },
     {
-      label: 'Sleep',
-      type: 'checkbox',
-      checked: sleeping,
+      label: 'Hide at left edge now',
       click: () => {
-        sleeping = !sleeping;
-        if (win) win.webContents.send('mochi:sleep-toggle', { sleeping });
-        refreshTrayMenu();
+        if (win && !win.isDestroyed()) win.webContents.send('mochi:dock-now');
+      },
+    },
+    {
+      label: 'Auto-hide at left edge',
+      type: 'checkbox',
+      checked: config.dockEnabled !== false,
+      click: (item) => {
+        config = deepMerge(config, { dockEnabled: item.checked });
+        persistConfig();
+        if (win && !win.isDestroyed()) win.webContents.send('mochi:config-changed', { ...config });
+      },
+    },
+    {
+      label: 'Reset position (bring Mochi back)',
+      click: () => {
+        if (!win) return;
+        forceOut();
+        const p = defaultPosition();
+        moveWindow(p.x, p.y);
+        win.show();
+        win.setAlwaysOnTop(true);
+        win.moveTop();
+      },
+    },
+    {
+      label: 'Use the screen my mouse is on',
+      click: () => {
+        if (!win) return;
+        const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+        config = deepMerge(config, { homeDisplayId: d.id });
+        persistConfig();
+        forceOut();
+        const p = defaultPosition();
+        moveWindow(p.x, p.y);
+        win.show();
+        win.setAlwaysOnTop(true);
+        win.moveTop();
       },
     },
     {
@@ -384,137 +614,17 @@ function registerShortcut() {
     const ok = globalShortcut.register('CmdOrCtrl+Shift+M', () => {
       if (!win) return;
       if (!win.isVisible()) {
-        win.showInactive();
+        win.show();
         windowVisible = true;
         refreshTrayMenu();
       }
+      win.focus();
+      win.moveTop();
       win.webContents.send('mochi:toggle-panel');
     });
     if (!ok) console.error('[mochi] global shortcut registration failed');
   } catch (err) {
     console.error('[mochi] globalShortcut error:', err.message);
-  }
-}
-
-/* ------------------------------------------------------------- tool bridge */
-
-const pendingApprovals = new Map(); // id -> { resolve, timer }
-
-// Renderer answers approval prompts via preload's respondApproval(id, approved).
-ipcMain.on('mochi:approval-response', (_e, resp) => {
-  if (!resp || typeof resp.id !== 'string') return;
-  const pending = pendingApprovals.get(resp.id);
-  if (!pending) return;
-  pendingApprovals.delete(resp.id);
-  clearTimeout(pending.timer);
-  pending.resolve(resp.approved === true);
-});
-
-// Ask the renderer to approve a non-read-only tool call. Resolves true when
-// the user approves; resolves false on deny or after a 60s timeout (default DENY).
-function requestApproval(sender, payload) {
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      pendingApprovals.delete(payload.id);
-      resolve(false);
-    }, 60_000);
-    pendingApprovals.set(payload.id, { resolve, timer });
-    sender.send('mochi:tool-approval', payload);
-  });
-}
-
-let toolRequestCounter = 0;
-
-async function invokeTool(event, name, args) {
-  // electron/tools.cjs is written by another agent; require it lazily so the
-  // shell boots fine before the tool layer exists.
-  let tools;
-  try {
-    tools = require('./tools.cjs');
-  } catch (err) {
-    if (err && err.code === 'MODULE_NOT_FOUND' && String(err.message).includes('tools.cjs')) {
-      return { ok: false, error: 'tools not built yet' };
-    }
-    return { ok: false, error: `tool loader failed: ${(err && err.message) || err}` };
-  }
-
-  const toolName = String(name);
-  const toolArgs = args && typeof args === 'object' ? args : {};
-
-  // Primary interface (electron/tools.cjs):
-  //   invokeTool(name, args, ctx) with ctx = { root, requestApproval }.
-  // Read-only tools run directly inside the module; write/shell tools call
-  // back into main's requestApproval, which implements the spec'd flow:
-  // send `mochi:tool-approval` {id, tool, args, description, detail},
-  // await `mochi:approval-response` for that id, 60s timeout → default DENY.
-  if (typeof tools.invokeTool === 'function') {
-    const requestApprovalFn = (info = {}) =>
-      requestApproval(event.sender, {
-        id: `tool-${Date.now()}-${(toolRequestCounter += 1)}`,
-        tool: info.tool || toolName,
-        args: info.args || toolArgs,
-        description: info.description || `Run tool "${toolName}"`,
-        detail: info.detail || JSON.stringify(toolArgs, null, 2),
-      });
-    const root =
-      config.workingFolder && config.workingFolder.length > 0
-        ? config.workingFolder
-        : app.getAppPath();
-    try {
-      return await tools.invokeTool(toolName, toolArgs, {
-        root,
-        requestApproval: requestApprovalFn,
-      });
-    } catch (err) {
-      return { ok: false, error: String((err && err.message) || err) };
-    }
-  }
-
-  // Fallback: registry-style export (tools[name] or tools.get(name)). A tool
-  // is read-only only when its own metadata says so; anything else goes
-  // through the user-approval flow above (default deny).
-  const entry = typeof tools.get === 'function' ? tools.get(toolName) : tools[toolName];
-  if (entry == null) {
-    return { ok: false, error: `unknown tool: ${toolName}` };
-  }
-
-  const readOnly =
-    (typeof entry === 'object' && entry !== null && entry.readOnly === true) ||
-    (typeof tools.isReadOnly === 'function' && tools.isReadOnly(toolName)) ||
-    (Array.isArray(tools.readOnly) && tools.readOnly.includes(toolName)) ||
-    (Array.isArray(tools.READ_ONLY) && tools.READ_ONLY.includes(toolName));
-
-  if (!readOnly) {
-    const approved = await requestApproval(event.sender, {
-      id: `tool-${Date.now()}-${(toolRequestCounter += 1)}`,
-      tool: toolName,
-      args: toolArgs,
-      description:
-        (typeof entry === 'object' && entry !== null && entry.description) ||
-        `Run tool "${toolName}"`,
-      detail:
-        (typeof entry === 'object' && entry !== null && entry.detail) ||
-        JSON.stringify(toolArgs, null, 2),
-    });
-    if (!approved) return { ok: false, denied: true };
-  }
-
-  const fn =
-    typeof entry === 'function'
-      ? entry
-      : entry.run ||
-        entry.invoke ||
-        entry.fn ||
-        (typeof tools.invoke === 'function' ? (a) => tools.invoke(toolName, a) : null);
-  if (typeof fn !== 'function') {
-    return { ok: false, error: `tool has no runnable entry: ${toolName}` };
-  }
-
-  try {
-    const result = await fn(toolArgs);
-    return { ok: true, result: result === undefined ? null : result };
-  } catch (err) {
-    return { ok: false, error: String((err && err.message) || err) };
   }
 }
 
@@ -528,20 +638,65 @@ function registerIpc() {
       config = deepMerge(config, patch);
       persistConfig();
       applyLoginItemSetting();
-      // Notify the renderer so live settings (scale, sounds, peek) apply.
       if (win && !win.isDestroyed()) win.webContents.send('mochi:config-changed', { ...config });
     }
     return { ...config };
   });
 
-  ipcMain.handle('mochi:get-position', () => loadPosition());
+  ipcMain.handle('mochi:get-position', () => {
+    if (win && !win.isDestroyed()) {
+      const [x, y] = win.getPosition();
+      return { x, y };
+    }
+    return loadPosition();
+  });
 
   ipcMain.on('mochi:save-position', (_e, pos) => {
     if (pos && typeof pos === 'object' && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
-      // Drag: move the window live (persistence stays debounced below).
-      if (win) win.setPosition(Math.round(pos.x), Math.round(pos.y));
-      savePositionDebounced(pos.x, pos.y);
+      const p = moveWindow(pos.x, pos.y);
+      if (p) savePositionDebounced(p.x, p.y);
     }
+  });
+
+  // Safe roaming range (window x/y) for the wander controller: dog fully visible.
+  ipcMain.handle('mochi:get-dock-geometry', () => dockGeometry());
+  ipcMain.handle('mochi:glide', (_e, t) => {
+    const x = Number(t && t.x);
+    const y = Number(t && t.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    const ms = Math.min(6000, Math.max(250, Number(t.ms) || 1000));
+    return glideTo(Math.round(x), Math.round(y), ms);
+  });
+  ipcMain.on('mochi:cancel-glide', () => cancelGlide());
+  ipcMain.on('mochi:set-docked', (_e, v) => {
+    docked = !!v;
+  });
+  ipcMain.handle('mochi:get-wander-bounds', () => posBounds(false));
+
+  // Chat panel opened/closed: when opening, nudge the window so the whole panel is visible.
+  ipcMain.on('mochi:panel-open', (_e, open) => {
+    panelOpen = !!open;
+    if (panelOpen && docked) {
+      cancelGlide();
+      docked = false; // opening chat (e.g. hotkey) while hidden brings the dog out
+    }
+    if (panelOpen) reclampWindow();
+  });
+
+  ipcMain.handle('mochi:get-displays', () => {
+    return screen.getAllDisplays().map((d) => ({
+      id: d.id,
+      bounds: d.bounds,
+      workArea: d.workArea,
+    }));
+  });
+
+  ipcMain.handle('mochi:get-screen-size', () => {
+    const primary = screen.getPrimaryDisplay();
+    return {
+      width: primary.workArea.width,
+      height: primary.workArea.height,
+    };
   });
 
   ipcMain.on('mochi:ignore-mouse', (_e, ignore) => {
@@ -566,8 +721,6 @@ function registerIpc() {
   });
 
   ipcMain.on('mochi:quit', () => app.quit());
-
-  ipcMain.handle('mochi:invoke-tool', (event, name, args) => invokeTool(event, name, args));
 }
 
 /* --------------------------------------------------------------- lifecycle */
@@ -575,12 +728,14 @@ function registerIpc() {
 app.whenReady().then(() => {
   registerIpc();
   createWindow();
+  screen.on('display-added', reclampWindow);
+  screen.on('display-removed', reclampWindow);
+  screen.on('display-metrics-changed', reclampWindow);
   createTray();
   registerShortcut();
   applyLoginItemSetting();
 });
 
-// Stay alive in the tray when the window is hidden/closed; quit via tray menu.
 app.on('window-all-closed', () => {});
 
 app.on('before-quit', () => {

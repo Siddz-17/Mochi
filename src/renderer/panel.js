@@ -1,145 +1,213 @@
 /**
  * @module renderer/panel
  *
- * Chat panel for Mochi: streaming message list, quick actions, history,
- * approval cards, and status line. Owns the `tools` adapter handed to the
- * provider's `send()`:
- *   - invokeTool(name, args) → bridge.invokeTool (main runs tools.cjs).
- *     Read-only tools run immediately; write/shell tools are challenged by
- *     main via `mochi:tool-approval`, which arrives here through
- *     bridge.onToolApprovalRequest. To avoid double-prompting when the
- *     panel already approved in-panel (mock demo flow), a recent in-panel
- *     approval for the same tool+args auto-answers the main challenge.
- *   - requestApproval(info) → renders a card into #approval-area.
+ * Chat panel for Mochi: speech-bubble style, streaming message list,
+ * chat history in localStorage, and dog companion responses.
  */
 
 import { MochiState, isAgentBusy } from '../state/mochiState.js';
-import { renderApprovalCard } from '../tools/approval.js';
-
-// Mirrors electron/tools.cjs READ_ONLY. Kept local: the renderer cannot
-// require() the main-side CJS module (context isolation).
-const READ_ONLY_TOOLS = new Set([
-  'files.list',
-  'files.read',
-  'files.search',
-  'git.status',
-  'git.diff',
-  'git.log',
-]);
 
 const HISTORY_KEY = 'mochi.chat.history';
-const HISTORY_CAP = 100;
-const PROVIDER_HISTORY = 20;
-const PRE_APPROVAL_TTL_MS = 120000;
-
-const QUICK_ACTIONS = [
-  'Explain this repo',
-  'What changed recently?',
-  'Find a bug',
-  'Write tests for…',
-  'Review my diff',
-];
-
-function approvalKey(tool, args) {
-  return `${tool}:${JSON.stringify(args || {})}`;
-}
+const HISTORY_CAP = 60;
 
 function esc(s) {
-  return String(s);
+  const d = document.createElement('div');
+  d.textContent = String(s);
+  return d.innerHTML;
 }
 
-/**
- * @param {HTMLElement} rootEl  The #panel element.
- * @param {{registry: {loadProvider: (id: string) => any}, bridge: any, dog?: {setAgentState?: (s: string) => void}, getConfig: () => any}} deps
- */
-export function createPanel(rootEl, deps) {
-  const { registry, bridge, dog, getConfig } = deps;
+export function createPanel(rootEl, deps = {}) {
+  const { registry, bridge = {}, dog, getConfig = () => ({}) } = deps;
 
   const messagesEl = rootEl.querySelector('#messages');
   const form = rootEl.querySelector('#chat-form');
   const input = rootEl.querySelector('#chat-input');
-  const approvalArea = rootEl.querySelector('#approval-area');
   const statusLine = rootEl.querySelector('#status-line');
-  const quickRow = rootEl.querySelector('#quick-actions');
-  const badge = rootEl.querySelector('#panel-badge');
+  const clearBtn = rootEl.querySelector('#chat-clear');
+  const closeBtn = rootEl.querySelector('#chat-close');
 
   let isOpen = false;
   let busy = false;
   let controller = null;
   let provider = null;
-  let providerError = null;
-  let cfg = {};
   let history = loadHistory();
-  const preApproved = new Map(); // approvalKey -> timestamp
 
-  /* ---------- setup ---------- */
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) return arr.slice(-HISTORY_CAP);
+      }
+    } catch {}
+    return [];
+  }
+
+  function saveHistory() {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-HISTORY_CAP)));
+    } catch {}
+  }
 
   function ensureProvider() {
-    if (provider || providerError) return provider;
+    if (provider) return provider;
+    const cfg = typeof getConfig === 'function' ? getConfig() : {};
     try {
       provider = registry.loadProvider(cfg.provider || 'mock');
     } catch (err) {
-      providerError = err;
-      setStatus(`provider error: ${err && err.message ? err.message : err}`);
+      console.warn('[mochi] failed to load provider:', err);
     }
-    updateStatusLine();
     return provider;
   }
 
-  // getConfig may be sync or async (preload's is an ipc invoke → Promise).
-  Promise.resolve(typeof getConfig === 'function' ? getConfig() : {})
-    .then((c) => {
-      cfg = c || {};
-      ensureProvider();
-      updateStatusLine();
-    })
-    .catch((err) => {
-      providerError = err;
-      setStatus(`provider error: ${err && err.message ? err.message : err}`);
-    });
-
-  buildQuickActions();
-  history.forEach((m) => appendMessage(m.role, m.content, { save: false }));
-  updateStatusLine();
-  setAgentState(MochiState.IDLE);
-
-  if (bridge && typeof bridge.onTogglePanel === 'function') {
-    bridge.onTogglePanel(() => toggle());
+  function appendMessage(role, content) {
+    const el = document.createElement('div');
+    el.className = `mochi-msg mochi-msg-${role}`;
+    el.innerHTML = esc(content).replace(/\n/g, '<br>');
+    messagesEl.appendChild(el);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return el;
   }
-  if (bridge && typeof bridge.onToolApprovalRequest === 'function') {
-    bridge.onToolApprovalRequest(handleMainApprovalRequest);
-  }
-  if (form) {
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      send(input ? input.value : '');
-      if (input) input.value = '';
-    });
-  }
-  rootEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') close();
-  });
 
-  /* ---------- public API ---------- */
+  function renderHistory() {
+    messagesEl.innerHTML = '';
+    if (history.length === 0) {
+      const cfg = typeof getConfig === 'function' ? getConfig() : {};
+      const greeting = cfg.userName
+        ? `Woof, ${cfg.userName}! I'm Mochi. Click me or type below to chat!`
+        : "Woof! I'm Mochi, your desktop dog companion! What's on your mind?";
+      appendMessage('assistant', greeting);
+    } else {
+      for (const msg of history) {
+        appendMessage(msg.role, msg.content);
+      }
+    }
+  }
+
+  function setStatus(text) {
+    if (statusLine) {
+      statusLine.textContent = text || '';
+    }
+  }
+
+  async function submitMessage(text) {
+    if (!text || busy) return;
+    const cleanText = text.trim();
+    if (!cleanText) return;
+
+    input.value = '';
+    busy = true;
+    form.querySelector('button[type="submit"]')?.setAttribute('disabled', 'true');
+
+    history.push({ role: 'user', content: cleanText });
+    saveHistory();
+    appendMessage('user', cleanText);
+
+    if (dog && typeof dog.setAgentState === 'function') {
+      dog.setAgentState(MochiState.THINKING);
+    }
+    setStatus('Mochi is thinking…');
+
+    const assistantMsgEl = appendMessage('assistant', '');
+    let assistantText = '';
+
+    controller = new AbortController();
+    const activeProvider = ensureProvider();
+    const cfg = typeof getConfig === 'function' ? getConfig() : {};
+
+    try {
+      if (!activeProvider) {
+        throw new Error('No provider available.');
+      }
+
+      for await (const event of activeProvider.send(
+        history,
+        {},
+        controller.signal,
+        { userName: cfg.userName }
+      )) {
+        if (!event) continue;
+
+        if (event.type === 'text-delta' && event.delta) {
+          assistantText += event.delta;
+          assistantMsgEl.innerHTML = esc(assistantText).replace(/\n/g, '<br>');
+          messagesEl.scrollTop = messagesEl.scrollHeight;
+        } else if (event.type === 'state') {
+          if (dog && typeof dog.setAgentState === 'function') {
+            dog.setAgentState(event.state);
+          }
+        } else if (event.type === 'error') {
+          assistantText += `\n[Error: ${event.message || 'Something went wrong.'}]`;
+          assistantMsgEl.innerHTML = esc(assistantText).replace(/\n/g, '<br>');
+          if (dog && typeof dog.setAgentState === 'function') {
+            dog.setAgentState(MochiState.ERROR);
+          }
+        }
+      }
+
+      if (assistantText.trim()) {
+        history.push({ role: 'assistant', content: assistantText.trim() });
+        saveHistory();
+      }
+
+      if (dog && typeof dog.setAgentState === 'function') {
+        dog.setAgentState(MochiState.DONE);
+      }
+      setStatus('');
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        assistantMsgEl.innerHTML = esc(`Woof... error: ${err.message || err}`);
+        if (dog && typeof dog.setAgentState === 'function') {
+          dog.setAgentState(MochiState.ERROR);
+        }
+        setStatus('Error occurred');
+      }
+    } finally {
+      busy = false;
+      controller = null;
+      form.querySelector('button[type="submit"]')?.removeAttribute('disabled');
+      input.focus();
+    }
+  }
+
+  function notifyOpen(v) {
+    try { if (typeof bridge.setPanelOpen === 'function') bridge.setPanelOpen(v); } catch {}
+    try { window.dispatchEvent(new CustomEvent('mochi:panel', { detail: { open: v } })); } catch {}
+  }
 
   function open() {
+    if (isOpen) return;
     isOpen = true;
-    rootEl.hidden = false;
-    rootEl.classList.add('open');
-    if (bridge && typeof bridge.focusWindow === 'function') bridge.focusWindow();
-    if (input) input.focus();
+    notifyOpen(true);
+    rootEl.classList.remove('hidden');
+    rootEl.removeAttribute('hidden');
+    renderHistory();
+    if (typeof bridge.focusWindow === 'function') {
+      try { bridge.focusWindow(); } catch {}
+    }
+    if (typeof bridge.setIgnoreMouseEvents === 'function') {
+      try { bridge.setIgnoreMouseEvents(false); } catch {}
+    }
+    if (dog && typeof dog.setPanelOpen === 'function') {
+      dog.setPanelOpen(true);
+    }
+    setTimeout(() => input?.focus(), 50);
   }
 
   function close() {
+    if (!isOpen) return;
     isOpen = false;
-    rootEl.classList.remove('open');
-    rootEl.hidden = true;
+    notifyOpen(false);
+    rootEl.classList.add('hidden');
+    rootEl.setAttribute('hidden', '');
     if (controller) {
-      try {
-        controller.abort();
-      } catch {
-        /* noop */
-      }
+      controller.abort();
+      controller = null;
+    }
+    busy = false;
+    setStatus('');
+    if (dog && typeof dog.setPanelOpen === 'function') {
+      dog.setPanelOpen(false);
     }
   }
 
@@ -148,242 +216,41 @@ export function createPanel(rootEl, deps) {
     else open();
   }
 
-  /**
-   * Render an approval card for a main-initiated request and wire the
-   * decision back through bridge.respondApproval.
-   */
-  function pushApprovalRequest(req) {
-    renderApprovalCard(approvalArea, req, (approved) => {
-      if (bridge && typeof bridge.respondApproval === 'function') {
-        bridge.respondApproval(req && req.id, !!approved);
-      }
+  // Event listeners
+  if (form) {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitMessage(input.value);
     });
   }
 
-  /* ---------- chat ---------- */
-
-  async function send(text) {
-    text = (text || '').trim();
-    if (!text) return;
-    if (busy) {
-      setStatus('Mochi is still working — one thing at a time!');
-      return;
-    }
-    const activeProvider = ensureProvider();
-    if (!activeProvider) {
-      appendMessage('assistant', 'No provider loaded. Check your mochi.config.json.');
-      return;
-    }
-    busy = true;
-    setInputEnabled(false);
-    appendMessage('user', text, { save: false });
-    pushHistory('user', text);
-    const streamBody = appendMessage('assistant', '', { stream: true });
-    let assistantText = '';
-
-    controller = new AbortController();
-    const tools = makeToolsAdapter();
-    setAgentState(MochiState.THINKING);
-
-    try {
-      const convo = history.slice(-PROVIDER_HISTORY).map((m) => ({ role: m.role, content: m.content }));
-      for await (const ev of activeProvider.send(convo, tools, controller.signal)) {
-        if (!ev || typeof ev !== 'object') continue;
-        switch (ev.type) {
-          case 'text-delta':
-            assistantText += esc(ev.delta || '');
-            streamBody.textContent = assistantText;
-            scrollBottom();
-            break;
-          case 'state':
-            setAgentState(ev.state);
-            break;
-          case 'tool-request':
-            appendToolNotice(ev);
-            break;
-          case 'tool-result':
-            appendToolResult(ev);
-            break;
-          case 'error':
-            assistantText += `\n⚠ ${ev.message || 'provider error'}`;
-            streamBody.textContent = assistantText;
-            setAgentState(MochiState.ERROR);
-            break;
-          case 'done':
-            break;
-          default:
-            break;
-        }
-      }
-      pushHistory('assistant', assistantText || '(no reply)');
-    } catch (err) {
-      const msg = err && err.name === 'AbortError' ? '(stopped)' : `⚠ ${err && err.message ? err.message : err}`;
-      assistantText += `\n${msg}`;
-      streamBody.textContent = assistantText;
-      pushHistory('assistant', assistantText);
-      setAgentState(MochiState.ERROR);
-    } finally {
-      busy = false;
-      controller = null;
-      setInputEnabled(true);
-      updateStatusLine();
-      scrollBottom();
-    }
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      history = [];
+      try { localStorage.removeItem(HISTORY_KEY); } catch {}
+      renderHistory();
+    });
   }
 
-  function makeToolsAdapter() {
-    return {
-      invokeTool: (name, args) => bridge.invokeTool(name, args || {}),
-      requestApproval: (info) =>
-        new Promise((resolve) => {
-          renderApprovalCard(approvalArea, info, (approved) => {
-            if (approved) preApproved.set(approvalKey(info.tool, info.args), Date.now());
-            resolve(approved);
-          });
-        }),
-    };
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      close();
+    });
   }
 
-  /** Main challenged us for a write/shell tool invoked through the bridge. */
-  function handleMainApprovalRequest(req) {
-    if (!req) return;
-    const key = approvalKey(req.tool, req.args);
-    const ts = preApproved.get(key);
-    if (ts && Date.now() - ts < PRE_APPROVAL_TTL_MS) {
-      // The user already approved this exact call in-panel (e.g. mock demo
-      // flow): answer the main challenge without prompting twice.
-      preApproved.delete(key);
-      if (bridge && typeof bridge.respondApproval === 'function') {
-        bridge.respondApproval(req.id, true);
-      }
-      return;
-    }
-    pushApprovalRequest(req);
+  // Intercept bridge toggle-panel signal
+  if (typeof bridge.onTogglePanel === 'function') {
+    bridge.onTogglePanel(() => toggle());
   }
 
-  /* ---------- rendering helpers ---------- */
-
-  function appendMessage(role, text, opts) {
-    const save = !opts || opts.save !== false;
-    const wrap = document.createElement('div');
-    wrap.className = `mochi-msg mochi-msg-${role}`;
-    const body = document.createElement('div');
-    body.className = 'mochi-msg-body';
-    body.style.whiteSpace = 'pre-wrap';
-    body.style.wordBreak = 'break-word';
-    body.textContent = esc(text);
-    wrap.appendChild(body);
-    if (messagesEl) messagesEl.appendChild(wrap);
-    scrollBottom();
-    if (save && !(opts && opts.stream)) pushHistory(role, text);
-    return body;
-  }
-
-  function appendToolNotice(ev) {
-    const auto = READ_ONLY_TOOLS.has(ev.tool);
-    const line = auto
-      ? `⚙ ${ev.tool} — read-only, running…`
-      : `⚙ ${ev.tool} — needs your approval…`;
-    const el = document.createElement('div');
-    el.className = 'mochi-msg mochi-tool-notice';
-    el.textContent = line;
-    el.style.fontSize = '11px';
-    el.style.opacity = '0.85';
-    if (messagesEl) messagesEl.appendChild(el);
-    scrollBottom();
-  }
-
-  function appendToolResult(ev) {
-    const el = document.createElement('div');
-    el.className = 'mochi-msg mochi-tool-result';
-    el.textContent = ev.ok ? `✓ ${ev.id || 'tool'} ok` : `✗ ${ev.id || 'tool'} failed${ev.error ? `: ${ev.error}` : ''}`;
-    el.style.fontSize = '11px';
-    el.style.opacity = '0.85';
-    if (messagesEl) messagesEl.appendChild(el);
-    scrollBottom();
-  }
-
-  function setAgentState(state) {
-    try {
-      if (dog && typeof dog.setAgentState === 'function') dog.setAgentState(state);
-    } catch {
-      /* dog animations are best-effort */
-    }
-    if (badge) {
-      const label =
-        state === MochiState.THINKING
-          ? '💭 thinking'
-          : state === MochiState.WORKING
-            ? '⚙ working'
-            : state === MochiState.NEEDS_APPROVAL
-              ? '⚠ needs approval'
-              : state === MochiState.DONE
-                ? '✓ done'
-                : state === MochiState.ERROR
-                  ? '✗ error'
-                  : '🐶 idle';
-      badge.textContent = label;
-    }
-    updateStatusLine(state);
-  }
-
-  function setStatus(text) {
-    if (statusLine) statusLine.textContent = text;
-  }
-
-  function updateStatusLine(state) {
-    const pid = provider ? provider.id : cfg.provider || 'mock';
-    const folder = cfg.root || cfg.workingFolder || 'repo';
-    const busyNote = state && isAgentBusy(state) ? ` · ${state}…` : '';
-    setStatus(`provider: ${pid} (not connected) · folder: ${folder}${busyNote}`);
-  }
-
-  function setInputEnabled(enabled) {
-    if (input) input.disabled = !enabled;
-    const btn = form ? form.querySelector('button[type="submit"]') : null;
-    if (btn) btn.disabled = !enabled;
-  }
-
-  function scrollBottom() {
-    if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-
-  function buildQuickActions() {
-    if (!quickRow) return;
-    quickRow.innerHTML = '';
-    for (const label of QUICK_ACTIONS) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'mochi-quick-action';
-      btn.textContent = label;
-      btn.addEventListener('click', () => send(label));
-      quickRow.appendChild(btn);
-    }
-  }
-
-  /* ---------- history ---------- */
-
-  function loadHistory() {
-    try {
-      const raw = localStorage.getItem(HISTORY_KEY);
-      const arr = raw ? JSON.parse(raw) : [];
-      return Array.isArray(arr)
-        ? arr.filter((m) => m && typeof m.content === 'string').slice(-HISTORY_CAP)
-        : [];
-    } catch {
-      return [];
-    }
-  }
-
-  function pushHistory(role, content) {
-    history.push({ role, content: String(content) });
-    if (history.length > HISTORY_CAP) history = history.slice(-HISTORY_CAP);
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-    } catch {
-      /* storage full / unavailable — chat still works */
-    }
-  }
-
-  return { open, close, toggle, isOpen: () => isOpen, pushApprovalRequest };
+  return {
+    open,
+    close,
+    toggle,
+    isOpen: () => isOpen,
+    destroy() {
+      close();
+      if (controller) controller.abort();
+    },
+  };
 }

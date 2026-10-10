@@ -1,89 +1,15 @@
 /**
- * dog.js — Mochi "dog life" renderer (the pixel-dog companion engine).
+ * dog.js — Mochi pixel-dog companion engine (sprite-based).
  *
- * ============================================================================
- * PUBLIC API
- * ============================================================================
- *   import { createDog } from './dog.js';
- *
- *   const dog = createDog(canvas, opts);
- *     canvas : the #dog-canvas <canvas> element (32x32 source frames).
- *     opts   : {
- *       bridge,                // window.mochi bridge (preload)
- *       effects,               // handle from createEffects(#effects-layer, sprites)
- *       onPanelToggleRequest,  // () => void — called on a clean click on the dog
- *       getScale,              // () => number — initial integer scale (2..6)
- *       sprites,               // optional shared { img, map } to avoid double load
- *     }
- *
- *   dog -> {
- *     setAgentState(state),  // MochiState value: idle/thinking/working/
- *                            //   needs-approval/done/error
- *     setScale(n),           // integer 2..6; resizes canvas, keeps pixels crisp
- *     setPeekMode(on),       // slide dog to the screen edge; peek frames only
- *     sleep(),               // enter sleep (static frame + zzz, timers paused)
- *     wake(),                // play `wake`, resume normal life
- *     destroy(),             // remove listeners, clear timers/effects
- *   }
- *
- * Life state machine: idle (base loop `idle-sit`), with one-shot actions
- * blink / ear-twitch / tail-wag / look-around / scratch / yawn / stretch /
- * walk, plus `sleep`, `drag`, and `peek` modes. Agent states (thinking,
- * working, needs-approval, done, error) temporarily take over the player and
- * pause the life loop; returning to idle resumes normal life.
- *
- * MochiState is imported from ../../state/mochiState.js with a defensive
- * dynamic import — if that module is missing, a local fallback enum is used.
- *
- * ============================================================================
- * CONFIG (via bridge.getConfig(), may be sync or async)
- * ============================================================================
- *   { scale: 4, sleepAfterMinutes: 5, calmMode: false }
- * Calm mode (or OS prefers-reduced-motion): no hop/walk/yawn/stretch, slower
- * blink, no sudden alert-bark.
- *
- * ============================================================================
- * ASSUMPTIONS / CONTRACT NOTES for the coordinator (boot.js) and main agent
- * ============================================================================
- * 1. DRAG: main owns the window position. On drag we compute the new x/y from
- *    the cursor and call bridge.savePosition(x, y) (throttled ~60Hz). The main
- *    process handler for savePosition MUST also call win.setPosition(x, y) —
- *    persisting alone will not move the window.
- * 2. CLICK-THROUGH: we hit-test the current frame's alpha and call
- *    bridge.setIgnoreMouseEvents(transparentPixel). For hover/eye-follow to
- *    keep working over transparent pixels, preload should forward mouse
- *    events: win.setIgnoreMouseEvents(ignore, { forward: true }).
- * 3. bridge.getPosition() / bridge.getConfig() may return a value or a
- *    Promise — both are handled.
- * 4. bridge.onSleepToggle(cb): cb receives `{ sleeping: boolean }` from the
- *    tray menu (a bare boolean is also accepted; anything else toggles).
- * 5. #effects-layer must be positioned over #dog-canvas (see styles.css) and
- *    #panel-badge hidden by default (shown on needs-approval).
- * 6. No rAF anywhere: frames advance via chained setTimeout honoring each
- *    frame's durationMs. All timers are cleared on sleep and on
- *    document.hidden, so idle CPU is ~0.
+ * Renders hand-crafted 32x32 pixel sprites on a 2D canvas with crisp pixelation.
+ * Supports idle life actions, cursor eye-following, petting, dragging with dangle/bounce,
+ * screen wandering walk cycles, and chatbot reactions.
  */
 
 import { loadSprites } from './spriteLoader.js';
+import { MochiState } from '../state/mochiState.js';
 
-// --- MochiState (defensive: another agent writes src/state/mochiState.js) ---
-const FALLBACK_MOCHI_STATE = {
-  IDLE: 'idle',
-  THINKING: 'thinking',
-  WORKING: 'working',
-  NEEDS_APPROVAL: 'needs-approval',
-  DONE: 'done',
-  ERROR: 'error',
-};
-let MochiState = FALLBACK_MOCHI_STATE;
-try {
-  const mod = await import('../../state/mochiState.js');
-  MochiState = mod.MochiState || mod.default || FALLBACK_MOCHI_STATE;
-} catch {
-  /* mochiState.js not present yet — use the fallback enum */
-}
-
-const TILE = 32; // source frame size in px
+const TILE = 32;
 const MIN_SCALE = 2;
 const MAX_SCALE = 6;
 const DEFAULTS = { scale: 4, sleepAfterMinutes: 5, calmMode: false };
@@ -103,20 +29,19 @@ export function createDog(canvas, opts = {}) {
   const onPanelToggleRequest =
     typeof opts.onPanelToggleRequest === 'function' ? opts.onPanelToggleRequest : () => {};
 
-  // ---------- mutable state ----------
   let config = { ...DEFAULTS };
   let sprites = opts.sprites || null;
   let scale = DEFAULTS.scale;
   try {
     const s = opts.getScale ? opts.getScale() : null;
     if (Number.isFinite(s)) scale = clampInt(s, MIN_SCALE, MAX_SCALE) || DEFAULTS.scale;
-  } catch { /* keep default */ }
+  } catch {}
 
-  let mode = 'idle'; // idle | sleep | drag | peek
+  let mode = 'idle'; // idle | sleep | drag
   let agentState = MochiState.IDLE;
   let agentToken = 0;
   let destroyed = false;
-  let peekOn = false;
+  let panelOpen = false;
 
   let player = { name: null, index: 0, loop: true, onDone: null };
   let frameTimer = null;
@@ -124,10 +49,9 @@ export function createDog(canvas, opts = {}) {
   let idleActionT = null;
   let blinkT = null;
   let sleepT = null;
-  let peekT = null;
   let dotsI = null;
 
-  let tiltX = 0; // draw offset in device px (hover tilt, walk wobble)
+  let tiltX = 0;
   let looking = null;
   let lastLookT = 0;
   let lastMouse = null;
@@ -138,6 +62,8 @@ export function createDog(canvas, opts = {}) {
   let pressInfo = null;
   let dragging = false;
   let lastDragSave = 0;
+  let lastToggleTime = 0;
+  let isWalkingManually = false;
 
   const ctx = canvas.getContext('2d');
   const alphaCanvas = document.createElement('canvas');
@@ -152,17 +78,15 @@ export function createDog(canvas, opts = {}) {
   let alphaData = null;
 
   const layerEl = document.getElementById('effects-layer');
-  const badgeEl = document.getElementById('panel-badge');
   const dotsEl = document.createElement('div');
   dotsEl.className = 'mochi-dots';
-  // Static styling lives in .mochi-dots (styles.css) for CSP.
+
   const disposers = [];
   const on = (target, ev, fn, o) => {
     target.addEventListener(ev, fn, o);
     disposers.push(() => target.removeEventListener(ev, fn, o));
   };
 
-  // ---------- tiny timer helper (all timers die on destroy) ----------
   function later(fn, ms) {
     if (destroyed) return null;
     const id = setTimeout(() => {
@@ -173,19 +97,18 @@ export function createDog(canvas, opts = {}) {
     return id;
   }
 
-  // ---------- config ----------
   async function loadConfig() {
     try {
       const c = await bridge.getConfig();
       if (c && typeof c === 'object') config = { ...config, ...c };
-    } catch { /* keep current config */ }
+    } catch {}
     try {
       const s = opts.getScale ? opts.getScale() : null;
       if (Number.isFinite(s)) {
         const n = clampInt(s, MIN_SCALE, MAX_SCALE);
         if (n) config.scale = n;
       }
-    } catch { /* keep current */ }
+    } catch {}
   }
 
   function isCalm() {
@@ -201,9 +124,9 @@ export function createDog(canvas, opts = {}) {
     }
   }
 
-  // ---------- animation player ----------
+  // Animation player
   function getAnim(name) {
-    const anims = sprites && sprites.map.animations;
+    const anims = sprites && sprites.map && sprites.map.animations;
     const a = anims && anims[name];
     if (a && Array.isArray(a.frames) && a.frames.length) return a;
     const fb = anims && anims['idle-sit'];
@@ -212,7 +135,7 @@ export function createDog(canvas, opts = {}) {
   }
 
   function drawCurrentFrame() {
-    if (!sprites) return;
+    if (!sprites || !sprites.img) return;
     const anim = getAnim(player.name || 'idle-sit');
     const f = anim.frames[player.index] || anim.frames[0];
     const s = scale;
@@ -231,7 +154,10 @@ export function createDog(canvas, opts = {}) {
   }
 
   function stopPlayer() {
-    if (frameTimer) { clearTimeout(frameTimer); frameTimer = null; }
+    if (frameTimer) {
+      clearTimeout(frameTimer);
+      frameTimer = null;
+    }
   }
 
   function advanceFrame() {
@@ -266,20 +192,24 @@ export function createDog(canvas, opts = {}) {
   const playLoop = (name) => startAnim(name, true, null);
   const playOnce = (name, onDone) => startAnim(name, false, onDone);
 
-  const lifeActive = () => !destroyed && mode === 'idle' && agentState === MochiState.IDLE;
+  const lifeActive = () =>
+    !destroyed && mode === 'idle' && agentState === MochiState.IDLE && !panelOpen && !isWalkingManually;
 
-  // ---------- life loop ----------
   function settleIdle() {
     if (destroyed || mode !== 'idle') return;
     tiltX = 0;
     looking = null;
     playLoop('idle-sit');
     scheduleIdleAction();
-    scheduleBlink(); // no-op if already armed
+    scheduleBlink();
   }
 
   function scheduleIdleAction() {
-    if (idleActionT) { clearTimeout(idleActionT); timers.delete(idleActionT); idleActionT = null; }
+    if (idleActionT) {
+      clearTimeout(idleActionT);
+      timers.delete(idleActionT);
+      idleActionT = null;
+    }
     if (destroyed) return;
     const lo = 3500, hi = 9000;
     idleActionT = later(doIdleAction, lo + Math.random() * (hi - lo));
@@ -296,9 +226,9 @@ export function createDog(canvas, opts = {}) {
     else if (r < 0.70 && !calm) playOnce('scratch', settleIdle);
     else if (r < 0.80 && !calm) playOnce('yawn', settleIdle);
     else if (r < 0.88 && !calm) playOnce('stretch', settleIdle);
-    else if (r < 0.94 && !calm) doWalk();
+    else if (r < 0.94 && !calm) doWalkWobble();
     else if (!calm) playOnce('tail-wag', settleIdle);
-    else settleIdle(); // calm: mostly just sit; blink timer covers blinking
+    else settleIdle();
   }
 
   function lookAround() {
@@ -307,82 +237,113 @@ export function createDog(canvas, opts = {}) {
     playOnce(anim, settleIdle);
   }
 
-  function doWalk() {
+  function doWalkWobble() {
     if (!lifeActive()) return;
     const dir = Math.random() < 0.5 ? 'walk-left' : 'walk-right';
     playLoop(dir);
-    // in-place wobble: the window doesn't move, so the dog paces on the spot
     [1, -1, 1, 0].forEach((o, i) => {
-      later(() => { if (lifeActive()) tiltX = o * scale; }, i * 300);
+      later(() => {
+        if (lifeActive()) tiltX = o * scale;
+      }, i * 300);
     });
-    later(() => { if (mode === 'idle') { tiltX = 0; settleIdle(); } }, 1300);
+    later(() => {
+      if (mode === 'idle') {
+        tiltX = 0;
+        settleIdle();
+      }
+    }, 1300);
   }
 
   function clearBlink() {
-    if (blinkT) { clearTimeout(blinkT); timers.delete(blinkT); blinkT = null; }
+    if (blinkT) {
+      clearTimeout(blinkT);
+      timers.delete(blinkT);
+      blinkT = null;
+    }
   }
 
   function scheduleBlink() {
-    // Guard: never reset an already-armed blink timer, so one-shot actions
-    // completing via settleIdle() don't starve the 3-6s blink cadence.
     if (blinkT || destroyed) return;
     const calm = isCalm();
     const ms = calm ? 6000 + Math.random() * 4000 : 3000 + Math.random() * 3000;
     blinkT = later(() => {
       blinkT = null;
-      // Only blink when sitting at rest — never interrupt another action.
       if (lifeActive() && player.name === 'idle-sit') {
-        playOnce('blink', () => { if (lifeActive() && mode === 'idle') playLoop('idle-sit'); });
+        playOnce('blink', () => {
+          if (lifeActive() && mode === 'idle') playLoop('idle-sit');
+        });
       }
       scheduleBlink();
     }, ms);
   }
 
-  // ---------- inactivity / sleep ----------
+  // Sleep / Inactivity
   function resetSleepTimer() {
-    if (sleepT) { clearTimeout(sleepT); timers.delete(sleepT); sleepT = null; }
-    if (destroyed || mode === 'sleep' || mode === 'peek') return;
-    if (agentState !== MochiState.IDLE) return; // never sleep mid-task
+    if (sleepT) {
+      clearTimeout(sleepT);
+      timers.delete(sleepT);
+      sleepT = null;
+    }
+    if (destroyed || mode === 'sleep') return;
+    if (agentState !== MochiState.IDLE) return;
     const mins = Math.max(0.05, Number(config.sleepAfterMinutes) || DEFAULTS.sleepAfterMinutes);
-    sleepT = later(() => { sleepT = null; sleep(); }, mins * 60000);
+    sleepT = later(() => {
+      sleepT = null;
+      sleep();
+    }, mins * 60000);
   }
 
   function poke() {
     if (destroyed) return;
-    if (mode === 'sleep') { wake(); return; }
+    if (mode === 'sleep') {
+      wake();
+      return;
+    }
     resetSleepTimer();
   }
 
   function sleep() {
+    if (mode === 'peek') return; // never fall asleep while hidden at the edge
     if (destroyed || mode === 'sleep' || mode === 'drag') return;
     clearAgentVisuals();
     mode = 'sleep';
-    if (idleActionT) { clearTimeout(idleActionT); timers.delete(idleActionT); idleActionT = null; }
+    if (idleActionT) {
+      clearTimeout(idleActionT);
+      timers.delete(idleActionT);
+      idleActionT = null;
+    }
     clearBlink();
-    if (sleepT) { clearTimeout(sleepT); timers.delete(sleepT); sleepT = null; }
+    if (sleepT) {
+      clearTimeout(sleepT);
+      timers.delete(sleepT);
+      sleepT = null;
+    }
     stopPlayer();
-    // Static sleep frame + static zzz: zero timers while asleep.
     player = { name: 'sleep', index: 0, loop: false, onDone: null };
     drawCurrentFrame();
     if (effects) {
       const p = effectXY('zzz');
-      effects.show('zzz', { x: Math.min(p.x + 10 * scale, canvas.width - 8 * scale), y: 0, static: true });
+      effects.show('zzz', {
+        x: Math.min(p.x + 10 * scale, canvas.width - 8 * scale),
+        y: 0,
+        static: true,
+      });
     }
   }
 
   function wake() {
     if (destroyed || mode !== 'sleep') return;
     if (effects) effects.clear('zzz');
-    loadConfig(); // refresh settings (calm mode etc.) on wake
+    loadConfig();
     mode = 'idle';
     playOnce('wake', settleIdle);
     resetSleepTimer();
   }
 
-  // ---------- agent reactions ----------
+  // Agent reactions
   function effectXY(name) {
-    const fx = sprites && sprites.map.effects[name];
-    const f = fx && fx.frames[0];
+    const fx = sprites && sprites.map && sprites.map.effects && sprites.map.effects[name];
+    const f = fx && fx.frames && fx.frames[0];
     const ew = f ? f.w * scale : 16;
     return { x: Math.round((canvas.width - ew) / 2) };
   }
@@ -394,25 +355,24 @@ export function createDog(canvas, opts = {}) {
     dotsEl.style.display = 'block';
     const frames = ['.  ', '.. ', '...'];
     let i = 0;
-    const tick = () => { dotsEl.textContent = frames[i++ % frames.length]; };
+    const tick = () => {
+      dotsEl.textContent = frames[i++ % frames.length];
+    };
     tick();
     dotsI = setInterval(tick, 450);
   }
-  function hideDots() {
-    if (dotsI) { clearInterval(dotsI); dotsI = null; }
-    dotsEl.style.display = 'none';
-  }
 
-  function showBadge(on_) {
-    try {
-      if (badgeEl) badgeEl.style.display = on_ ? 'block' : 'none';
-    } catch { /* badge element optional */ }
+  function hideDots() {
+    if (dotsI) {
+      clearInterval(dotsI);
+      dotsI = null;
+    }
+    dotsEl.style.display = 'none';
   }
 
   function clearAgentVisuals() {
     if (effects) for (const n of AGENT_EFFECTS) effects.clear(n);
     hideDots();
-    showBadge(false);
   }
 
   function setAgentState(state) {
@@ -421,8 +381,11 @@ export function createDog(canvas, opts = {}) {
     clearAgentVisuals();
     if (destroyed) return;
     if (mode === 'sleep') wake();
-    if (mode === 'peek') setPeekMode(false);
-    if (idleActionT) { clearTimeout(idleActionT); timers.delete(idleActionT); idleActionT = null; }
+    if (idleActionT) {
+      clearTimeout(idleActionT);
+      timers.delete(idleActionT);
+      idleActionT = null;
+    }
     clearBlink();
     stopPlayer();
 
@@ -431,30 +394,25 @@ export function createDog(canvas, opts = {}) {
         playLoop('think');
         if (effects) effects.show('ellipsis', { x: effectXY('ellipsis').x, y: 2, loop: true });
         break;
-      case MochiState.WORKING:
-        playLoop('work');
-        showDots();
-        break;
-      case MochiState.NEEDS_APPROVAL:
-        playOnce('alert-bark', () => {
-          if (agentToken === tok && agentState === MochiState.NEEDS_APPROVAL) playLoop('idle-sit');
-        });
-        if (effects) effects.show('exclaim', { x: effectXY('exclaim').x, y: 2, loop: true });
-        showBadge(true);
-        try { if (typeof bridge.focusWindow === 'function') bridge.focusWindow(); } catch { /* optional */ }
-        break;
       case MochiState.DONE:
         if (isCalm()) {
           playLoop('idle-sit');
         } else {
-          playOnce('hop', () => { if (agentToken === tok) playLoop('idle-sit'); });
+          playOnce('hop', () => {
+            if (agentToken === tok) playLoop('idle-sit');
+          });
         }
         if (effects) effects.show('sparkle', { x: effectXY('sparkle').x, y: 14, ms: 1600 });
-        later(() => { if (agentToken === tok) setAgentState(MochiState.IDLE); }, 1600);
+        later(() => {
+          if (agentToken === tok) setAgentState(MochiState.IDLE);
+        }, 1600);
         break;
       case MochiState.ERROR:
         playLoop('sad');
         if (effects) effects.show('sweat', { x: effectXY('sweat').x, y: 4, loop: true });
+        later(() => {
+          if (agentToken === tok) setAgentState(MochiState.IDLE);
+        }, 3000);
         break;
       default:
         agentState = MochiState.IDLE;
@@ -463,7 +421,22 @@ export function createDog(canvas, opts = {}) {
     resetSleepTimer();
   }
 
-  // ---------- click-through hit testing ----------
+  // Click-through hit-testing
+  function isOverInteractiveUI(clientX, clientY) {
+    const panelEl = document.getElementById('panel');
+    if (panelEl && !panelEl.hidden && !panelEl.classList.contains('hidden')) {
+      const pr = panelEl.getBoundingClientRect();
+      if (clientX >= pr.left && clientX <= pr.right && clientY >= pr.top && clientY <= pr.bottom) {
+        return true;
+      }
+    }
+    const settingsEl = document.getElementById('settings');
+    if (settingsEl && settingsEl.classList.contains('mset-open')) {
+      return true;
+    }
+    return false;
+  }
+
   function alphaAt(sx, sy) {
     if (!alphaData || sx < 0 || sy < 0 || sx >= TILE || sy >= TILE) return 0;
     return alphaData[(sy * TILE + sx) * 4 + 3];
@@ -472,16 +445,22 @@ export function createDog(canvas, opts = {}) {
   function updateClickThrough(clientX, clientY) {
     if (dragging || destroyed) return;
     if (typeof bridge.setIgnoreMouseEvents !== 'function') return;
+    if (isOverInteractiveUI(clientX, clientY)) {
+      try {
+        bridge.setIgnoreMouseEvents(false);
+      } catch {}
+      return;
+    }
     const r = canvas.getBoundingClientRect();
     const sx = Math.floor((clientX - r.left) / scale);
     const sy = Math.floor((clientY - r.top) / scale);
     const transparent = alphaAt(sx, sy) < 8;
     try {
-      bridge.setIgnoreMouseEvents(transparent);
-    } catch { /* optional */ }
+      bridge.setIgnoreMouseEvents(transparent, { forward: true });
+    } catch {}
   }
 
-  // ---------- mouse: eye-follow, bark, petting ----------
+  // Mouse interactions
   function distToCenter(clientX, clientY) {
     const r = canvas.getBoundingClientRect();
     return Math.hypot(clientX - (r.left + r.width / 2), clientY - (r.top + r.height / 2));
@@ -501,15 +480,21 @@ export function createDog(canvas, opts = {}) {
     const dx = e.clientX - (r.left + r.width / 2);
     const dy = e.clientY - (r.top + r.height / 2);
     if (Math.hypot(dx, dy) < 14) {
-      if (looking) { looking = null; playLoop('idle-sit'); }
+      if (looking) {
+        looking = null;
+        playLoop('idle-sit');
+      }
       return;
     }
     const ang = (Math.atan2(dy, dx) * 180) / Math.PI;
     const dir =
-      ang >= -45 && ang < 45 ? 'look-right'
-      : ang >= 45 && ang < 135 ? 'look-down'
-      : ang >= -135 && ang < -45 ? 'look-up'
-      : 'look-left';
+      ang >= -45 && ang < 45
+        ? 'look-right'
+        : ang >= 45 && ang < 135
+        ? 'look-down'
+        : ang >= -135 && ang < -45
+        ? 'look-up'
+        : 'look-left';
     const now = Date.now();
     if (dir !== looking && now - lastLookT > 600) {
       looking = dir;
@@ -537,8 +522,6 @@ export function createDog(canvas, opts = {}) {
       if (dragging) return;
     }
     if (mode === 'sleep') {
-      // Cursor within ~120px of the dog wakes it (window is tiny, so in
-      // practice any activity over the window wakes the dog).
       if (distToCenter(e.clientX, e.clientY) < 120) wake();
       return;
     }
@@ -546,7 +529,7 @@ export function createDog(canvas, opts = {}) {
     poke();
     updateClickThrough(e.clientX, e.clientY);
 
-    // Fast cursor movement -> perk up (throttled, not in calm mode).
+    // Fast cursor movement perk-up
     if (lastMove) {
       const dt = now - lastMove.t;
       if (dt > 0) {
@@ -559,7 +542,7 @@ export function createDog(canvas, opts = {}) {
     }
     lastMove = { t: now, x: e.clientX, y: e.clientY };
 
-    // Petting: rapid rubbing over the head region (several hits within 600ms).
+    // Petting head region
     const s = toSource(e.clientX, e.clientY);
     if (s.x >= 9 && s.x <= 23 && s.y >= 1 && s.y <= 13) {
       petHits.push(now);
@@ -576,7 +559,7 @@ export function createDog(canvas, opts = {}) {
 
   function onMouseEnter() {
     if (!lifeActive()) return;
-    tiltX = scale; // slight tilt (draw offset) while the ear twitches
+    tiltX = scale;
     playOnce('ear-twitch', () => {
       tiltX = 0;
       if (lifeActive()) settleIdle();
@@ -587,53 +570,66 @@ export function createDog(canvas, opts = {}) {
     tiltX = 0;
   }
 
-  // ---------- drag & click ----------
+  // Drag & Click
   async function windowPosition() {
     try {
       const p = await bridge.getPosition();
       if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) return p;
-    } catch { /* fall through */ }
+    } catch {}
     return { x: 0, y: 0 };
   }
 
   async function onMouseDown(e) {
     if (destroyed || e.button !== 0) return;
-    // mousedown only fires on opaque pixels (click-through), so the dog
-    // itself was pressed.
-    if (mode === 'sleep') { wake(); return; }
+    if (mode === 'sleep') {
+      wake();
+      return;
+    }
     poke();
     const pos = await windowPosition();
     pressInfo = {
       t: Date.now(),
-      sx: e.screenX, sy: e.screenY,
-      dx: e.screenX - pos.x, dy: e.screenY - pos.y, // cursor grab offset
+      sx: e.screenX,
+      sy: e.screenY,
+      dx: e.screenX - pos.x,
+      dy: e.screenY - pos.y,
     };
     try {
       if (e.pointerId != null && canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
-    } catch { /* optional */ }
+    } catch {}
   }
 
   function handleDragMove(e) {
     const p = pressInfo;
     if (!p || destroyed) return;
     if (!dragging && Math.hypot(e.screenX - p.sx, e.screenY - p.sy) > 5) {
+      try { if (typeof opts.onDragStart === 'function') opts.onDragStart(); } catch {}
       dragging = true;
       mode = 'drag';
-      if (idleActionT) { clearTimeout(idleActionT); timers.delete(idleActionT); idleActionT = null; }
+      if (idleActionT) {
+        clearTimeout(idleActionT);
+        timers.delete(idleActionT);
+        idleActionT = null;
+      }
       clearBlink();
-      if (sleepT) { clearTimeout(sleepT); timers.delete(sleepT); sleepT = null; }
+      if (sleepT) {
+        clearTimeout(sleepT);
+        timers.delete(sleepT);
+        sleepT = null;
+      }
       stopPlayer();
       playLoop('drag-dangle');
-      try { bridge.setIgnoreMouseEvents(false); } catch { /* optional */ }
+      try {
+        bridge.setIgnoreMouseEvents(false);
+      } catch {}
     }
     if (dragging) {
       const now = Date.now();
       if (now - lastDragSave > 16) {
         lastDragSave = now;
-        // ASSUMPTION: main's savePosition handler also calls win.setPosition.
         try {
           bridge.savePosition(Math.round(e.screenX - p.dx), Math.round(e.screenY - p.dy));
-        } catch { /* optional */ }
+        } catch {}
       }
     }
   }
@@ -642,72 +638,95 @@ export function createDog(canvas, opts = {}) {
     if (!pressInfo) return;
     const p = pressInfo;
     pressInfo = null;
-    if (destroyed) { dragging = false; return; }
+    if (destroyed) {
+      dragging = false;
+      return;
+    }
     const dt = Date.now() - p.t;
     const moved = Math.hypot(e.screenX - p.sx, e.screenY - p.sy);
     if (dragging) {
       dragging = false;
       try {
         bridge.savePosition(Math.round(e.screenX - p.dx), Math.round(e.screenY - p.dy));
-      } catch { /* optional */ }
+      } catch {}
       mode = 'idle';
+      try { if (typeof opts.onDragEnd === 'function') opts.onDragEnd(); } catch {}
       playOnce('drop-bounce', settleIdle);
       resetSleepTimer();
-    } else if (dt < 300 && moved < 5) {
-      // Clean click (not a drag): toggle the panel.
-      loadConfig(); // refresh settings on interaction
-      try { onPanelToggleRequest(); } catch { /* optional */ }
+    } else if (dt < 600 && moved < 8) {
+      lastToggleTime = Date.now();
+      loadConfig();
+      try {
+        onPanelToggleRequest();
+      } catch {}
     }
   }
 
-  // ---------- peek mode ----------
-  function applyPeekTransform() {
-    const sliver = 10 * scale; // how much of the dog stays visible
-    canvas.style.transform = `translateX(${canvas.width - sliver}px)`;
+  // Wandering walk cycles
+  function startWalk(direction) {
+    if (destroyed || mode === 'drag' || mode === 'sleep') return;
+    isWalkingManually = true;
+    const anim = direction === 'left' ? 'walk-left' : 'walk-right';
+    playLoop(anim);
   }
 
-  function schedulePeek() {
-    if (peekT) { clearTimeout(peekT); timers.delete(peekT); peekT = null; }
-    if (destroyed) return;
-    peekT = later(() => {
-      peekT = null;
-      if (mode !== 'peek' || destroyed) return;
-      playOnce('peek', () => {
-        if (mode === 'peek') { playLoop('peek'); schedulePeek(); }
-      });
-    }, 8000 + Math.random() * 12000);
+  function stopWalk() {
+    if (destroyed || mode === 'drag' || mode === 'sleep') return;
+    isWalkingManually = false;
+    settleIdle();
   }
 
-  function setPeekMode(on_) {
-    peekOn = !!on_;
+  // Hidden at the screen edge, peeking: hold the 'peek' loop, no idle actions.
+  function setDocked(on_) {
     if (destroyed) return;
-    if (peekOn) {
-      if (mode === 'sleep') wake();
+    if (on_) {
+      if (mode === 'sleep') mode = 'idle';
       mode = 'peek';
-      clearAgentVisuals();
-      if (idleActionT) { clearTimeout(idleActionT); timers.delete(idleActionT); idleActionT = null; }
-      clearBlink();
-      if (sleepT) { clearTimeout(sleepT); timers.delete(sleepT); sleepT = null; }
+      isWalkingManually = false;
+      for (const t of [idleActionT, blinkT, sleepT]) {
+        if (t) { clearTimeout(t); timers.delete(t); }
+      }
+      idleActionT = null;
+      blinkT = null;
+      sleepT = null;
       stopPlayer();
-      applyPeekTransform();
       playLoop('peek');
-      schedulePeek();
-    } else {
-      canvas.style.transform = '';
-      if (peekT) { clearTimeout(peekT); timers.delete(peekT); peekT = null; }
+    } else if (mode === 'peek' || mode === 'sleep') {
       mode = 'idle';
+      isWalkingManually = false;
       settleIdle();
       resetSleepTimer();
     }
   }
 
-  // ---------- scale ----------
+  function setPanelOpen(on_) {
+    panelOpen = !!on_;
+    if (panelOpen) {
+      if (mode === 'sleep') wake();
+      settleIdle();
+    }
+  }
+
+  function setCalmMode(on_) {
+    config.calmMode = !!on_;
+  }
+
+  // Scale & sizing
   function sizeCanvas() {
     canvas.width = TILE * scale;
     canvas.height = TILE * scale;
     canvas.style.width = `${canvas.width}px`;
     canvas.style.height = `${canvas.height}px`;
     canvas.style.imageRendering = 'pixelated';
+    const stageEl = document.getElementById('stage');
+    if (stageEl) {
+      stageEl.style.width = `${canvas.width}px`;
+      stageEl.style.height = `${canvas.height}px`;
+    }
+    const panelEl = document.getElementById('panel');
+    if (panelEl) {
+      panelEl.style.bottom = `${canvas.height + 28}px`;
+    }
   }
 
   function setScale(n) {
@@ -717,78 +736,104 @@ export function createDog(canvas, opts = {}) {
     sizeCanvas();
     drawCurrentFrame();
     if (effects && typeof effects.setScale === 'function') effects.setScale(nn);
-    if (mode === 'peek') applyPeekTransform();
     if (lastMouse) updateClickThrough(lastMouse.x, lastMouse.y);
   }
 
-  // ---------- document visibility: fully pause timers when hidden ----------
+  function setSize(px) {
+    const s = Math.round(Number(px) / TILE);
+    setScale(s);
+  }
+
   function onVisibilityChange() {
     if (destroyed) return;
     if (document.hidden) {
       stopPlayer();
-      if (idleActionT) { clearTimeout(idleActionT); timers.delete(idleActionT); idleActionT = null; }
+      if (idleActionT) {
+        clearTimeout(idleActionT);
+        timers.delete(idleActionT);
+        idleActionT = null;
+      }
       clearBlink();
-      if (peekT) { clearTimeout(peekT); timers.delete(peekT); peekT = null; }
-      // sleepT intentionally keeps running: an idle-away user should find
-      // the dog asleep.
     } else {
-      if (mode === 'sleep') { drawCurrentFrame(); return; }
-      advanceFrame(); // resume mid-animation from the saved frame index
+      if (mode === 'sleep') {
+        drawCurrentFrame();
+        return;
+      }
+      advanceFrame();
       if (mode === 'idle' && agentState === MochiState.IDLE) {
         scheduleIdleAction();
         scheduleBlink();
       }
-      if (mode === 'peek') schedulePeek();
     }
   }
 
-  // ---------- destroy ----------
   function destroy() {
     destroyed = true;
     for (const d of disposers.splice(0)) {
-      try { d(); } catch { /* ignore */ }
+      try {
+        d();
+      } catch {}
     }
-    for (const id of [...timers]) { clearTimeout(id); timers.delete(id); }
+    for (const id of [...timers]) {
+      clearTimeout(id);
+      timers.delete(id);
+    }
     stopPlayer();
-    if (dotsI) { clearInterval(dotsI); dotsI = null; }
+    if (dotsI) {
+      clearInterval(dotsI);
+      dotsI = null;
+    }
     if (effects) effects.clearAll();
-    showBadge(false);
-    try { dotsEl.remove(); } catch { /* ignore */ }
-    try { bridge.setIgnoreMouseEvents(false); } catch { /* optional */ }
+    try {
+      dotsEl.remove();
+    } catch {}
+    try {
+      bridge.setIgnoreMouseEvents(false);
+    } catch {}
   }
 
-  // ---------- init ----------
   function wireEvents() {
-    // Note: only window gets 'mousemove' — canvas events bubble to window, and
-    // a second canvas-level listener would double-count petting/velocity.
     on(window, 'mousemove', onMouseMove);
     on(window, 'mouseup', onMouseUp);
     on(canvas, 'mouseenter', onMouseEnter);
     on(canvas, 'mouseleave', onMouseLeave);
     on(canvas, 'mousedown', onMouseDown);
+    on(canvas, 'click', (e) => {
+      e.stopPropagation();
+      if (dragging) return;
+      if (Date.now() - lastToggleTime < 300) return;
+      lastToggleTime = Date.now();
+      loadConfig();
+      try {
+        onPanelToggleRequest();
+      } catch {}
+    });
     on(document, 'visibilitychange', onVisibilityChange);
     try {
       if (typeof bridge.onSleepToggle === 'function') {
         bridge.onSleepToggle((v) => {
-          // Main sends { sleeping: bool } via the tray; accept a bare boolean
-          // too, and fall back to toggling when nothing usable arrives.
           const toSleep =
-            typeof v === 'boolean' ? v
-            : v && typeof v.sleeping === 'boolean' ? v.sleeping
-            : mode !== 'sleep';
-          if (toSleep) sleep(); else wake();
+            typeof v === 'boolean'
+              ? v
+              : v && typeof v.sleeping === 'boolean'
+              ? v.sleeping
+              : mode !== 'sleep';
+          if (toSleep) sleep();
+          else wake();
         });
       }
-    } catch { /* optional */ }
+    } catch {}
   }
 
   async function init() {
     sizeCanvas();
     wireEvents();
     await loadConfig();
-    // Apply config scale (no-op if unchanged).
     const cs = clampInt(config.scale, MIN_SCALE, MAX_SCALE);
-    if (cs && cs !== scale) { scale = cs; sizeCanvas(); }
+    if (cs && cs !== scale) {
+      scale = cs;
+      sizeCanvas();
+    }
     if (!sprites) {
       try {
         sprites = await loadSprites();
@@ -804,5 +849,17 @@ export function createDog(canvas, opts = {}) {
   }
   init();
 
-  return { setAgentState, setScale, setPeekMode, sleep, wake, destroy };
+  return {
+    setAgentState,
+    setScale,
+    setSize,
+    setCalmMode,
+    startWalk,
+    stopWalk,
+    setPanelOpen,
+    setDocked,
+    sleep,
+    wake,
+    destroy,
+  };
 }

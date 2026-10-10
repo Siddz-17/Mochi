@@ -1,1 +1,35 @@
-{"description":"Mochi — a pixel-dog desktop companion that lives on your screen.","devDependencies":{"electron":"^44.7.0"},"main":"electron/main.cjs","name":"mochi","scripts":{"build:sprites":"node scripts/build-sprites.cjs","smoke":"node scripts/smoke.cjs","start":"electron ."},"type":"module","version":"0.1.0"}
+{
+  "name": "mochi",
+  "version": "0.1.0",
+  "description": "Mochi — a vector white Japanese dog desktop companion and chatbot.",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "node scripts/smoke.cjs",
+    "build:sprites": "node scripts/build-sprites.cjs",
+    "dist": "electron-builder --win dir",
+    "dist:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^44.7.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.mochi.desktop",
+    "productName": "Mochi",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "assets/**/*",
+      "electron/**/*",
+      "src/**/*",
+      "mochi.config.json",
+      "package.json"
+    ],
+    "win": {
+      "target": "dir"
+    }
+  }
+}
