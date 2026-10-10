@@ -1,0 +1,40 @@
+<!-- boot.js is written by the build coordinator; do not add inline logic here -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'"
+  />
+  <title>Mochi</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <link rel="stylesheet" href="./settings.css" />
+</head>
+<body>
+  <div id="stage">
+    <canvas id="dog-canvas"></canvas>
+    <div id="effects-layer"></div>
+  </div>
+
+  <div id="panel" class="hidden">
+    <div id="messages"></div>
+    <div id="quick-actions"></div>
+    <form id="chat-form">
+      <input id="chat-input" type="text" autocomplete="off" spellcheck="false" placeholder="Talk to Mochi…" />
+      <button type="submit" id="chat-send" aria-label="Send">&#x27A4;</button>
+    </form>
+    <div id="approval-area"></div>
+    <div id="status-line"></div>
+  </div>
+
+  <div id="settings" class="hidden">
+    <div id="settings-form"></div>
+  </div>
+
+  <div id="panel-badge" class="hidden"></div>
+
+  <script type="module" src="./boot.js"></script>
+</body>
+</html>

@@ -1,0 +1,285 @@
+/* Mochi pixel UI — system fonts only (no webfonts, no network). */
+
+:root {
+  --ink: #3a3f4a;      /* dark-gray outline color */
+  --paper: #fdfdf6;    /* warm off-white */
+  --accent: #f7a8b8;   /* mochi pink */
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: "Courier New", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--ink);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.hidden {
+  display: none;
+}
+
+/* ------------------------------------------------------------------ stage */
+
+#stage {
+  position: fixed;
+  inset: 0;
+  /* Frameless-window drag lives on the stage; interactive UI opts out below. */
+  -webkit-app-region: drag;
+}
+
+#dog-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+#effects-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------------ panel
+   Chat panel: speech bubble anchored bottom-left, near the dog. */
+
+#panel {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  width: 300px;
+  max-height: 340px;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  border: 4px solid var(--ink);
+  border-radius: 4px;
+  box-shadow: 6px 6px 0 var(--ink);
+  -webkit-app-region: no-drag;
+  font-size: 13px;
+  line-height: 1.4;
+  z-index: 10;
+}
+
+/* Speech-bubble tail pointing down-left toward the dog. */
+#panel::after {
+  content: "";
+  position: absolute;
+  left: 52px;
+  bottom: -15px;
+  width: 18px;
+  height: 18px;
+  background: var(--paper);
+  border-right: 4px solid var(--ink);
+  border-bottom: 4px solid var(--ink);
+  transform: rotate(45deg) skew(10deg, 10deg);
+}
+
+#messages {
+  flex: 1;
+  min-height: 110px;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 10px 8px;
+}
+
+#quick-actions button {
+  font: inherit;
+  background: var(--accent);
+  color: var(--ink);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--ink);
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+#quick-actions button:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
+#chat-form {
+  display: flex;
+  gap: 6px;
+  padding: 0 10px 8px;
+}
+
+#chat-input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  background: #ffffff;
+  color: var(--ink);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  padding: 6px 8px;
+  outline: none;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+#chat-input:focus {
+  background: var(--paper);
+}
+
+#chat-send {
+  font: inherit;
+  background: var(--ink);
+  color: var(--paper);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--accent);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+#chat-send:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--accent);
+}
+
+#approval-area {
+  padding: 0 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#status-line {
+  border-top: 3px solid var(--ink);
+  background: var(--accent);
+  padding: 6px 10px;
+  font-size: 11px;
+  min-height: 18px;
+}
+
+/* ---------------------------------------------------------------- settings */
+
+#settings {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  width: 320px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: var(--paper);
+  border: 4px solid var(--ink);
+  border-radius: 4px;
+  box-shadow: 6px 6px 0 var(--ink);
+  -webkit-app-region: no-drag;
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  z-index: 20;
+}
+
+#settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* --------------------------------------------------------------- badge
+   Small badge pinned near the panel's top-right corner; shown while a
+   tool approval is waiting for the user. */
+
+#panel-badge {
+  position: fixed;
+  left: 298px;
+  bottom: 338px;
+  width: 20px;
+  height: 20px;
+  background: var(--accent);
+  border: 3px solid var(--ink);
+  border-radius: 50%;
+  box-shadow: 3px 3px 0 var(--ink);
+  -webkit-app-region: no-drag;
+  z-index: 30;
+}
+
+/* Pixel speech bubble used by extras (pomodoro, reminders) when the effects
+   module has no text-bubble API. Kept in CSS (not JS cssText) so the strict
+   style-src CSP is honored. */
+.mochi-bubble {
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  transform: translateX(-50%);
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: var(--paper, #fdfdf6);
+  color: var(--ink, #3a3f4a);
+  border: 3px solid var(--ink, #3a3f4a);
+  box-shadow: 4px 4px 0 rgba(58, 63, 74, 0.25);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 50;
+  pointer-events: none;
+}
+
+/* Pomodoro chip (created by src/extras/pomodoro.js). Shown/hidden by toggling
+   style.display; all static styling lives here for CSP compliance. */
+.mochi-pomodoro {
+  position: absolute;
+  left: 50%;
+  bottom: 6px;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--paper, #fdfdf6);
+  color: var(--ink, #3a3f4a);
+  border: 3px solid var(--ink, #3a3f4a);
+  box-shadow: 3px 3px 0 rgba(58, 63, 74, 0.25);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  cursor: pointer;
+  user-select: none;
+  z-index: 40;
+  image-rendering: pixelated;
+}
+.mochi-pomodoro-label {
+  color: var(--accent, #f7a8b8);
+}
+
+/* Working-state progress dots under the dog (src/renderer/dog.js). */
+.mochi-dots {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 0;
+  pointer-events: none;
+  display: none;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 1px 1px 0 #000;
+}
