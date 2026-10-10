@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Electron build / packaging output
+dist/
+out/
+*.dmg
+*.exe
+*.AppImage
+*.snap
+*.deb
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Mochi runtime data (lives in the OS userData dir at runtime, but ignore
+# any local copies)
+position.json

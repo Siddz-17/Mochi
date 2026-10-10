@@ -1,0 +1,1 @@
+{"description":"Mochi — a pixel-dog desktop companion that lives on your screen.","devDependencies":{"electron":"^44.7.0"},"main":"electron/main.cjs","name":"mochi","scripts":{"build:sprites":"node scripts/build-sprites.cjs","smoke":"node scripts/smoke.cjs","start":"electron ."},"type":"module","version":"0.1.0"}
