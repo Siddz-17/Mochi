@@ -29,7 +29,8 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "signAndEditExecutable": false
     }
   },
   "dependencies": {

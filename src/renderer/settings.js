@@ -67,6 +67,10 @@ export function createSettings(rootEl, deps = {}) {
             <input id="mset-peek" class="mset-check" type="checkbox" data-f="peekMode">
           </div>
           <div class="mset-row">
+            <label for="mset-ontop">Always on top <span class="mset-hint">(off = lives on the desktop, under your apps)</span></label>
+            <input id="mset-ontop" class="mset-check" type="checkbox" data-f="alwaysOnTop">
+          </div>
+          <div class="mset-row">
             <label for="mset-sleep">Sleep after (minutes idle)</label>
             <input id="mset-sleep" class="mset-num" type="number" data-f="sleepAfterMinutes"
               min="1" max="120" step="1">

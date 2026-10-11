@@ -1,9 +1,10 @@
 /**
  * @module renderer/panel
  *
- * Chat panel for Mochi: streaming message list, quick actions, history,
- * approval cards, and status line. Owns the `tools` adapter handed to the
- * provider's `send()`:
+ * Chat panel for Mochi: streaming message list, approval cards, and status
+ * line. Opens only on explicit toggle (dog click / hotkey / tray) and pops
+ * out directly under the dog like a speech bubble (see positionPanel).
+ * Owns the `tools` adapter handed to the provider's `send()`:
  *   - invokeTool(name, args) → bridge.invokeTool (main runs tools.cjs).
  *     Read-only tools run immediately; write/shell tools are challenged by
  *     main via `mochi:tool-approval`, which arrives here through
@@ -34,14 +35,6 @@ const HISTORY_CAP = 100;
 const PROVIDER_HISTORY = 20;
 const PRE_APPROVAL_TTL_MS = 120000;
 
-const QUICK_ACTIONS = [
-  'Explain this repo',
-  'What changed recently?',
-  'Find a bug',
-  'Write tests for…',
-  'Review my diff',
-];
-
 function approvalKey(tool, args) {
   return `${tool}:${JSON.stringify(args || {})}`;
 }
@@ -62,8 +55,9 @@ export function createPanel(rootEl, deps) {
   const input = rootEl.querySelector('#chat-input');
   const approvalArea = rootEl.querySelector('#approval-area');
   const statusLine = rootEl.querySelector('#status-line');
-  const quickRow = rootEl.querySelector('#quick-actions');
-  const badge = rootEl.querySelector('#panel-badge');
+  // #panel-badge is a sibling of #panel (not a child), so it must be looked
+  // up on the document, not inside rootEl.
+  const badge = document.getElementById('panel-badge');
   const stopBtn = rootEl.querySelector('#chat-stop');
   const regenBtn = rootEl.querySelector('#chat-regen');
   const exportBtn = rootEl.querySelector('#chat-export');
@@ -104,7 +98,6 @@ export function createPanel(rootEl, deps) {
       setStatus(`provider error: ${err && err.message ? err.message : err}`);
     });
 
-  buildQuickActions();
   history.forEach((m) =>
     appendMessage(m.role, m.content, { save: false, markdown: m.role === 'assistant' })
   );
@@ -144,7 +137,34 @@ export function createPanel(rootEl, deps) {
 
   /* ---------- public API ---------- */
 
+  /**
+   * Anchor the panel directly under the dog sprite so the chat pops out
+   * like a speech bubble next to the dog at any sprite scale, and shrink
+   * its max-height so it always fits inside the window. Called on every
+   * open() because the dog may have been dragged since the last open.
+   */
+  function positionPanel() {
+    let s = 4;
+    try {
+      const c = typeof getConfig === 'function' ? getConfig() : {};
+      const n = Math.round(Number(c && c.scale));
+      if (Number.isFinite(n)) s = Math.min(6, Math.max(2, n));
+    } catch {
+      /* keep default */
+    }
+    const dogPx = 32 * s;
+    rootEl.style.left = '0px';
+    rootEl.style.top = `${dogPx + 10}px`;
+    rootEl.style.maxHeight = `${Math.max(160, 480 - dogPx - 26)}px`;
+    if (badge) {
+      badge.style.left = `${dogPx - 14}px`;
+      badge.style.top = '6px';
+      badge.style.bottom = 'auto';
+    }
+  }
+
   function open() {
+    positionPanel();
     isOpen = true;
     rootEl.hidden = false;
     rootEl.classList.add('open');
@@ -463,19 +483,6 @@ export function createPanel(rootEl, deps) {
 
   function scrollBottom() {
     if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-
-  function buildQuickActions() {
-    if (!quickRow) return;
-    quickRow.innerHTML = '';
-    for (const label of QUICK_ACTIONS) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'mochi-quick-action';
-      btn.textContent = label;
-      btn.addEventListener('click', () => send(label));
-      quickRow.appendChild(btn);
-    }
   }
 
   /* ---------- history ---------- */

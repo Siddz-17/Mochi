@@ -65,6 +65,9 @@ const DEFAULT_CONFIG = {
   workingFolder: '',
   openAtLogin: false,
   autoUpdate: false,
+  // false = Mochi lives on the desktop layer: visible on the desktop but
+  // normal apps cover him. true = classic always-on-top companion.
+  alwaysOnTop: false,
   panelHotkey: 'CmdOrCtrl+Shift+M',
   sleepAfterMinutes: 5,
   peekMode: false,
@@ -113,6 +116,14 @@ function applyLoginItemSetting() {
     app.setLoginItemSettings({ openAtLogin: !!config.openAtLogin });
   } catch (err) {
     console.error('[mochi] setLoginItemSettings failed:', err.message);
+  }
+}
+
+function applyAlwaysOnTopSetting() {
+  try {
+    if (win && !win.isDestroyed()) win.setAlwaysOnTop(!!config.alwaysOnTop);
+  } catch (err) {
+    console.error('[mochi] setAlwaysOnTop failed:', err.message);
   }
 }
 
@@ -274,8 +285,14 @@ function createWindow() {
     ...(useSavedPos ? { x: savedPos.x, y: savedPos.y } : {}),
     transparent: true,
     frame: false,
-    alwaysOnTop: true,
+    // Desktop-layer by default (config.alwaysOnTop): Mochi sits on the
+    // desktop like a widget instead of floating above every app.
+    alwaysOnTop: !!config.alwaysOnTop,
     skipTaskbar: true,
+    // Windows: tool windows (WS_EX_TOOLWINDOW) are excluded from Alt+Tab.
+    // Harmless elsewhere; applied on win32 only. Verify on a real machine —
+    // Alt+Tab behavior can't be tested headless.
+    ...(process.platform === 'win32' ? { type: 'toolbar' } : {}),
     hasShadow: false,
     resizable: false,
     fullscreenable: false,
@@ -673,6 +690,7 @@ function registerIpc() {
       config = deepMerge(config, patch);
       persistConfig();
       applyLoginItemSetting();
+      applyAlwaysOnTopSetting();
       applyAutoUpdateSetting();
       // Notify the renderer so live settings (scale, sounds, peek) apply.
       if (win && !win.isDestroyed()) win.webContents.send('mochi:config-changed', { ...config });
