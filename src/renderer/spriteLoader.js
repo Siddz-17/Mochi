@@ -35,6 +35,7 @@ const KNOWN_ANIMATIONS = [
   'sleep', 'wake', 'yawn', 'stretch', 'scratch',
   'happy', 'pet-squint', 'hop', 'sad', 'think', 'work',
   'alert-bark', 'drag-dangle', 'drop-bounce', 'peek',
+  'sneeze', 'shake', 'tail-chase',
 ];
 
 const KNOWN_EFFECTS = [
