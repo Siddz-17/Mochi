@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mochi — Sprite Preview</title>
+<style>
+  /* NOTE: opening this file directly via file:// may block fetch() of
+     framemap.json (browser CORS rules for local files). If you see the
+     error box below, serve the repo root instead:
+       python3 -m http.server
+     then open http://localhost:8000/preview.html */
+  :root { color-scheme: dark; }
+  body {
+    background: #14161c; color: #e8ecf4;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    margin: 0; padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 28px 0 12px; color: #9fb6ff; text-transform: uppercase; letter-spacing: 2px; }
+  p.sub { color: #8a93a6; font-size: 13px; margin: 0 0 16px; }
+  .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .toolbar label { font-size: 13px; color: #8a93a6; }
+  .scale-btns { display: flex; gap: 6px; }
+  .scale-btns button {
+    font: inherit; font-size: 13px; cursor: pointer;
+    background: #1e2230; color: #e8ecf4;
+    border: 2px solid #3a3f4a; border-radius: 6px; padding: 4px 12px;
+  }
+  .scale-btns button.active { border-color: #ffd94d; color: #ffd94d; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .cell {
+    background: #1a1e28; border: 2px solid #2a2f3d; border-radius: 8px;
+    padding: 10px; text-align: center;
+  }
+  .cell .name { font-size: 12px; color: #c8d0e0; margin-bottom: 8px; word-break: break-all; }
+  .cell .meta { font-size: 10px; color: #6a7386; margin-top: 8px; }
+  canvas {
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    background: #23262e; border-radius: 4px;
+  }
+  #error {
+    display: none; background: #3a1f24; border: 2px solid #f5a3b5;
+    border-radius: 8px; padding: 16px; margin: 16px 0; font-size: 13px;
+  }
+  #error code { background: #23262e; padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Mochi — sprite preview</h1>
+<p class="sub">All animations + effects from <code>assets/sprites/</code>, playing at authored timings.</p>
+<div class="toolbar">
+  <label>Scale:</label>
+  <div class="scale-btns" id="scaleBtns"></div>
+</div>
+<div id="error"></div>
+<h2>Animations</h2>
+<div class="grid" id="anims"></div>
+<h2>Effects</h2>
+<div class="grid" id="effects"></div>
+
+<script>
+(function () {
+  'use strict';
+  var SCALE = 4;
+  var players = [];
+
+  function showError(msg) {
+    var el = document.getElementById('error');
+    el.style.display = 'block';
+    el.innerHTML = msg;
+  }
+
+  function makeCell(container, name, entry, img, tile) {
+    var cell = document.createElement('div');
+    cell.className = 'cell';
+    var label = document.createElement('div');
+    label.className = 'name';
+    label.textContent = name;
+    var canvas = document.createElement('canvas');
+    var meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = entry.frames.length + ' frames · ' + (entry.loop ? 'loop' : 'once');
+    cell.appendChild(label);
+    cell.appendChild(canvas);
+    cell.appendChild(meta);
+    container.appendChild(cell);
+
+    var ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    var player = {
+      entry: entry, canvas: canvas, ctx: ctx, img: img, tile: tile,
+      t0: performance.now() + Math.random() * 400, // slight desync so the grid feels alive
+      draw: function (now) {
+        var frames = this.entry.frames;
+        var total = 0, i, acc = 0;
+        for (i = 0; i < frames.length; i++) total += frames[i].durationMs;
+        var el = now - this.t0;
+        var fi;
+        if (this.entry.loop) {
+          el = el % total;
+          for (i = 0; i < frames.length; i++) { acc += frames[i].durationMs; if (el < acc) break; }
+          fi = Math.min(i, frames.length - 1);
+        } else {
+          if (el < total) {
+            for (i = 0; i < frames.length; i++) { acc += frames[i].durationMs; if (el < acc) break; }
+            fi = Math.min(i, frames.length - 1);
+          } else if (el < total + 900) {
+            fi = frames.length - 1; // hold last frame briefly…
+          } else {
+            this.t0 = now; fi = 0;   // …then replay
+          }
+        }
+        var f = frames[fi];
+        this.canvas.width = f.w * SCALE;
+        this.canvas.height = f.h * SCALE;
+        this.ctx.imageSmoothingEnabled = false;
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        this.ctx.drawImage(this.img, f.x, f.y, f.w, f.h, 0, 0, f.w * SCALE, f.h * SCALE);
+      }
+    };
+    players.push(player);
+    return player;
+  }
+
+  function applyScale() {
+    var now = performance.now();
+    players.forEach(function (p) { p.draw(now); });
+    var btns = document.querySelectorAll('#scaleBtns button');
+    btns.forEach(function (b) {
+      b.classList.toggle('active', parseInt(b.dataset.scale, 10) === SCALE);
+    });
+  }
+
+  function tick(now) {
+    players.forEach(function (p) { p.draw(now); });
+    requestAnimationFrame(tick);
+  }
+
+  // scale selector 2x–6x, default 4x
+  var scaleWrap = document.getElementById('scaleBtns');
+  [2, 3, 4, 5, 6].forEach(function (s) {
+    var b = document.createElement('button');
+    b.textContent = s + 'x';
+    b.dataset.scale = s;
+    b.addEventListener('click', function () { SCALE = s; applyScale(); });
+    scaleWrap.appendChild(b);
+  });
+
+  var img = new Image();
+  var imgReady = new Promise(function (resolve, reject) {
+    img.onload = resolve;
+    img.onerror = function () { reject(new Error('spritesheet.png failed to load')); };
+    img.src = 'assets/sprites/spritesheet.png';
+  });
+  var jsonReady = fetch('assets/sprites/framemap.json').then(function (r) {
+    if (!r.ok) throw new Error('framemap.json: HTTP ' + r.status);
+    return r.json();
+  });
+
+  Promise.all([imgReady, jsonReady]).then(function (res) {
+    var fm = res[1];
+    var tile = (fm.meta && fm.meta.tile) || 32;
+    Object.keys(fm.animations).sort().forEach(function (name) {
+      makeCell(document.getElementById('anims'), name, fm.animations[name], img, tile);
+    });
+    Object.keys(fm.effects).sort().forEach(function (name) {
+      makeCell(document.getElementById('effects'), name, fm.effects[name], img, tile);
+    });
+    applyScale();
+    requestAnimationFrame(tick);
+  }).catch(function (err) {
+    showError(
+      '<b>Could not load sprites:</b> ' + String(err && err.message || err) + '<br><br>' +
+      'If you opened this file directly (<code>file://</code>), browsers block ' +
+      '<code>fetch()</code> of local JSON. Serve the repo root instead:<br><br>' +
+      '<code>python3 -m http.server</code><br><br>' +
+      'then open <code>http://localhost:8000/preview.html</code>'
+    );
+  });
+})();
+</script>
+</body>
+</html>

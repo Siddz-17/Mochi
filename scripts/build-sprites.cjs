@@ -70,6 +70,7 @@ const DEFAULT_LOOP = {
   stretch: false, scratch: false, happy: false, 'pet-squint': false, hop: false,
   sad: true, think: true, work: true, 'alert-bark': false, 'drag-dangle': true,
   'drop-bounce': false, peek: true,
+  sneeze: false, shake: false, 'tail-chase': false,
   'fx-heart': true, 'fx-sparkle': true, 'fx-ellipsis': true, 'fx-exclaim': false,
   'fx-zzz': true, 'fx-steam': true, 'fx-sweat': true,
 };
