@@ -4,11 +4,14 @@
  *
  * CommonJS (.cjs) because package.json is "type": "module".
  * Owns: BrowserWindow (transparent, frameless, always-on-top), tray icon,
- * global shortcut, config persistence (mochi.config.json), window position
- * memory (userData/position.json), login-item toggle, --smoke test mode,
- * and the minimal mochi:* IPC bridge consumed via electron/preload.cjs.
+ * global shortcut (user-customizable panel hotkey), single-instance lock,
+ * renderer crash recovery, config persistence (mochi.config.json), window
+ * position memory (userData/position.json), login-item toggle, --smoke test
+ * mode, and the full mochi:* IPC bridge consumed via electron/preload.cjs.
  *
- * No network calls, no telemetry.
+ * No network calls, no telemetry. No AI provider / API key / secret handling.
+ * (The opt-in auto-updater lazily loads electron-updater only when enabled;
+ * see the AUTO-UPDATE CONTRACT section.)
  */
 
 const path = require('node:path');
@@ -25,55 +28,28 @@ const {
   screen,
 } = require('electron');
 
+// Lazy-loaded below in the auto-update section (only imported when the user
+// opts in) so default builds never touch the network.
+
 const SMOKE_MODE = process.argv.includes('--smoke');
 const IS_ROOT =
   typeof process.getuid === 'function' && process.getuid() === 0;
 
 // Chromium refuses to start as root without this (CI / containers).
+// Best-effort fallback: the native startup check runs before this JS loads,
+// so launchers should ALSO pass --no-sandbox on the real command line
+// (scripts/smoke.cjs does this automatically when uid is 0).
 if (IS_ROOT) {
   app.commandLine.appendSwitch('no-sandbox');
 }
 
-// Transparent windows can render as fully invisible with some Windows GPU
-// drivers. Launch with `npm start -- --no-gpu` to rule that out.
-if (process.argv.includes('--no-gpu')) {
-  app.disableHardwareAcceleration();
-}
+/* ------------------------------------------------------- single-instance */
 
-// Log file so problems are visible even when the window is not:
-// %APPDATA%\mochi\mochi.log
-function logLine(msg) {
-  try {
-    fs.appendFileSync(
-      path.join(app.getPath('userData'), 'mochi.log'),
-      `[${new Date().toISOString()}] ${msg}\n`
-    );
-  } catch {
-    /* logging must never crash the app */
-  }
-}
-
-if (!SMOKE_MODE) {
-  const gotTheLock = app.requestSingleInstanceLock();
-  if (!gotTheLock) {
-    console.log('[mochi] another instance is already running; exiting.');
-    app.quit();
-    process.exit(0);
-  } else {
-    // Launching again (e.g. a stale/invisible copy is already running) should
-    // REVEAL the existing dog instead of silently doing nothing.
-    app.on('second-instance', () => {
-      if (win) {
-        forceOut();
-        const p = defaultPosition();
-        moveWindow(p.x, p.y);
-        if (!win.isVisible()) win.show();
-        win.setAlwaysOnTop(true);
-        win.moveTop();
-        win.webContents.send('mochi:toggle-panel');
-      }
-    });
-  }
+// Only one Mochi may run at a time. A second launch is redirected here and
+// exits; the running instance restores/focuses its window in the
+// 'second-instance' handler (registered in the lifecycle section below).
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
 }
 
 /* ------------------------------------------------------------------ config */
@@ -83,14 +59,17 @@ const CONFIG_PATH = path.join(__dirname, '..', 'mochi.config.json');
 const DEFAULT_CONFIG = {
   provider: 'mock',
   scale: 4,
-  userName: '',
-  wanderEnabled: true,
-  homeDisplayId: null,
-  dockEnabled: true,
-  dockIdleSeconds: 20,
-  dockPeekPx: 44,
   calmMode: false,
+  soundsEnabled: false,
+  userName: '',
+  workingFolder: '',
+  openAtLogin: false,
+  autoUpdate: false,
+  panelHotkey: 'CmdOrCtrl+Shift+M',
   sleepAfterMinutes: 5,
+  peekMode: false,
+  pomodoro: { enabled: false, focusMinutes: 25, breakMinutes: 5 },
+  reminders: { stretch: true, water: true, intervalMinutes: 45 },
 };
 
 function isPlainObject(v) {
@@ -114,6 +93,7 @@ function loadConfig() {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
     return deepMerge(DEFAULT_CONFIG, JSON.parse(raw));
   } catch {
+    // Missing or corrupt config: fall back to defaults (deep copy).
     return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   }
 }
@@ -149,162 +129,13 @@ function loadPosition() {
       return { x: Math.round(p.x), y: Math.round(p.y) };
     }
   } catch {
-    // No saved position yet
+    // No saved position yet — caller falls back to the default placement.
   }
   return null;
 }
 
-/* ------------------------------------------------------- screen geometry
- * The window is a fixed 560x480 transparent box; the dog sits in its
- * bottom-right corner and the chat panel opens up/left of the dog.
- * ALL window moves are clamped here, in the main process, so the dog can
- * never leave the visible area no matter what the renderer asks for.
- * Only ONE display is used: the "home" display (primary, or the one chosen
- * from the tray menu). This is what fixes "invisible on the laptop screen".
- */
-const WIN_W = 560;
-const WIN_H = 480;
-const INSET = 16; // CSS: #stage right/bottom
-const PANEL_W = 320;
-const PANEL_H = 310; // CSS max-height
-const PANEL_GAP = 24;
-let panelOpen = false;
-let docked = false; // true while hidden at the left edge, peeking
-let glideTimer = null;
-let glideResolve = null;
-
-function layout() {
-  const sc = Math.min(6, Math.max(2, Math.round(Number(config.scale)) || 4));
-  const dog = 32 * sc;
-  const dogR = WIN_W - INSET;
-  const dogB = WIN_H - INSET;
-  return {
-    dogL: dogR - dog,
-    dogR,
-    dogT: dogB - dog,
-    dogB,
-    panelL: dogR - PANEL_W,
-    panelT: WIN_H - (dog + PANEL_GAP) - PANEL_H,
-  };
-}
-
-function homeDisplay() {
-  const all = screen.getAllDisplays();
-  return all.find((d) => d.id === config.homeDisplayId) || screen.getPrimaryDisplay();
-}
-
-// Allowed window x/y range so the DOG (and the panel, when open) stay fully
-// inside the home display's work area (i.e. above the taskbar).
-function posBounds(withPanel) {
-  const wa = homeDisplay().workArea;
-  const L = layout();
-  let minX = wa.x - L.dogL;
-  let maxX = wa.x + wa.width - L.dogR;
-  let minY = wa.y - L.dogT;
-  let maxY = wa.y + wa.height - L.dogB;
-  if (withPanel) {
-    minX = Math.max(minX, wa.x - L.panelL);
-    minY = Math.max(minY, wa.y - L.panelT);
-  }
-  if (minX > maxX) minX = maxX;
-  if (minY > maxY) minY = maxY;
-  return { minX, maxX, minY, maxY };
-}
-
-function clampPos(x, y, withPanel = panelOpen) {
-  const b = posBounds(withPanel);
-  return {
-    x: Math.round(Math.min(b.maxX, Math.max(b.minX, Number(x) || 0))),
-    y: Math.round(Math.min(b.maxY, Math.max(b.minY, Number(y) || 0))),
-  };
-}
-
-// setBounds (not setPosition) so Windows DPI rounding can never resize the window.
-function moveWindow(x, y) {
-  if (!win || win.isDestroyed()) return null;
-  const p = clampPos(x, y);
-  win.setBounds({ x: p.x, y: p.y, width: WIN_W, height: WIN_H });
-  return p;
-}
-
-// Where the window sits when the dog is hidden at the LEFT edge (only a
-// sliver of the dog shows) and where it sits when popped out.
-function dockGeometry() {
-  const wa = homeDisplay().workArea;
-  const L = layout();
-  const b = posBounds(false);
-  const dogW = L.dogR - L.dogL;
-  const sliver = Math.min(dogW - 8, Math.max(16, Number(config.dockPeekPx) || 44));
-  const cy = win && !win.isDestroyed() ? win.getPosition()[1] : b.maxY;
-  const y = Math.round(Math.min(b.maxY, Math.max(b.minY, cy)));
-  return {
-    peekX: Math.round(wa.x - L.dogL - dogW + sliver),
-    outX: Math.round(wa.x + 24 - L.dogL),
-    y,
-  };
-}
-
-function cancelGlide() {
-  if (glideTimer) {
-    clearInterval(glideTimer);
-    glideTimer = null;
-  }
-  if (glideResolve) {
-    const r = glideResolve;
-    glideResolve = null;
-    r(false);
-  }
-}
-
-// Smooth eased window move (used to walk the dog to / from the left edge).
-// Raw coordinates on purpose: the peek position is partly off-screen.
-function glideTo(ex, ey, ms) {
-  return new Promise((resolve) => {
-    if (!win || win.isDestroyed()) return resolve(false);
-    cancelGlide();
-    const [sx, sy] = win.getPosition();
-    const t0 = Date.now();
-    glideResolve = resolve;
-    glideTimer = setInterval(() => {
-      if (!win || win.isDestroyed()) return cancelGlide();
-      const k = Math.min(1, (Date.now() - t0) / ms);
-      const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
-      win.setBounds({
-        x: Math.round(sx + (ex - sx) * e),
-        y: Math.round(sy + (ey - sy) * e),
-        width: WIN_W,
-        height: WIN_H,
-      });
-      if (k >= 1) {
-        clearInterval(glideTimer);
-        glideTimer = null;
-        glideResolve = null;
-        if (!docked) savePositionDebounced(ex, ey);
-        resolve(true);
-      }
-    }, 16);
-  });
-}
-
-// Reset/second-launch/screen-change: bring the dog fully out and tell the renderer.
-function forceOut() {
-  cancelGlide();
-  docked = false;
-  if (win && !win.isDestroyed()) win.webContents.send('mochi:dock-state', { state: 'out' });
-}
-
-function reclampWindow() {
-  if (docked && win && !win.isDestroyed()) {
-    const g = dockGeometry();
-    win.setBounds({ x: g.peekX, y: g.y, width: WIN_W, height: WIN_H });
-    return;
-  }
-  if (!win || win.isDestroyed()) return;
-  const [x, y] = win.getPosition();
-  const p = moveWindow(x, y);
-  if (p) savePositionDebounced(p.x, p.y);
-}
-
+// Ignore a saved position that would strand the window off every display
+// (e.g. a monitor was unplugged since the last session).
 function positionOnScreen(pos) {
   try {
     const display = screen.getDisplayNearestPoint({ x: pos.x, y: pos.y });
@@ -340,6 +171,8 @@ function savePositionDebounced(x, y) {
 
 /* ------------------------------------------- tray icon (pure-JS PNG, zlib) */
 
+// ORIGINAL 16x16 white-dog-face pixel pattern, drawn for this project.
+// '.' = transparent, 'W' = white, 'k' = dark outline (#3a3f4a).
 const DOG_FACE = [
   '................',
   '..kk......kk....',
@@ -398,7 +231,7 @@ function buildTrayPng() {
   for (const line of DOG_FACE) {
     if (line.length !== W) throw new Error('tray pattern row is not 16 chars');
     const row = Buffer.alloc(1 + W * 4);
-    row[0] = 0;
+    row[0] = 0; // PNG filter: None
     for (let x = 0; x < W; x++) {
       const ch = line[x];
       const px = ch === 'W' ? WHITE : ch === 'k' ? INK : CLEAR;
@@ -412,8 +245,9 @@ function buildTrayPng() {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(W, 0);
   ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // color type: RGBA
+  // ihdr[10..12] = compression / filter / interlace, all zero
   const idat = zlib.deflateSync(Buffer.concat(rows));
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -427,30 +261,21 @@ function buildTrayPng() {
 
 let win = null;
 let tray = null;
+let sleeping = false;
 let windowVisible = true;
-
-function defaultPosition() {
-  try {
-    const b = posBounds(false);
-    return clampPos(b.maxX - 24, b.maxY, false); // bottom-right of the home screen
-  } catch {
-    return { x: 100, y: 100 };
-  }
-}
 
 function createWindow() {
   const savedPos = loadPosition();
-  const pos = savedPos ? clampPos(savedPos.x, savedPos.y, false) : defaultPosition();
+  const useSavedPos = savedPos && positionOnScreen(savedPos);
 
   win = new BrowserWindow({
-    width: WIN_W,
-    height: WIN_H,
-    x: pos.x,
-    y: pos.y,
+    width: 560,
+    height: 480,
+    ...(useSavedPos ? { x: savedPos.x, y: savedPos.y } : {}),
     transparent: true,
     frame: false,
     alwaysOnTop: true,
-    skipTaskbar: false,
+    skipTaskbar: true,
     hasShadow: false,
     resizable: false,
     fullscreenable: false,
@@ -467,23 +292,20 @@ function createWindow() {
   win.loadFile(path.join(__dirname, '..', 'src', 'renderer', 'index.html'));
 
   win.once('ready-to-show', () => {
-    win.show();
-    win.focus();
-    win.setAlwaysOnTop(true);
-    win.moveTop();
+    win.showInactive(); // never steal focus on launch
     windowVisible = true;
     refreshTrayMenu();
-    console.log('[mochi] window is visible at:', JSON.stringify(win.getBounds()));
-    logLine('window shown at ' + JSON.stringify(win.getBounds()));
-
     if (SMOKE_MODE) {
       setTimeout(async () => {
+        // Integration probe: verify the renderer boot completed and all
+        // modules were constructed (window.__mochi is set at end of boot.js).
         try {
           const probe = await win.webContents.executeJavaScript(
             `(() => { const m = window.__mochi; return m ? {
               boot: true,
               dog: !!m.dog, panel: !!m.panel, settings: !!m.settings,
-              wander: !!m.wander, effects: !!m.effects,
+              effects: !!m.effects, pomodoro: !!m.pomodoro,
+              reminders: !!m.reminders, sound: !!m.sound,
             } : { boot: false }; })()`,
             true
           );
@@ -515,19 +337,35 @@ function createWindow() {
     refreshTrayMenu();
   });
 
-  win.webContents.on('console-message', (e, level, message, line, sourceId) => {
-    const d = e && typeof e.message === 'string' ? e : { level, message, lineNumber: line, sourceId };
-    const text = `[renderer-console] ${d.sourceId}:${d.lineNumber} ${d.message}`;
-    console.log(text);
-    logLine(text);
+  // Crash recovery: if the renderer stops responding, offer to reload it.
+  // Chat history is safe — panel.js persists it to localStorage on every
+  // message, not on unload.
+  win.on('unresponsive', () => {
+    const { dialog } = require('electron');
+    if (win.isDestroyed()) return;
+    const choice = dialog.showMessageBoxSync(win, {
+      type: 'warning',
+      buttons: ['Reload', 'Wait'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Mochi is not responding',
+      message: 'The Mochi window stopped responding.',
+      detail: 'Reloading restarts the dog and panel. Your chat history is kept.',
+    });
+    if (choice === 0 && !win.isDestroyed()) win.webContents.reload();
   });
-  win.webContents.on('did-fail-load', (_e, code, desc) => {
-    console.log(`[renderer-load-failed] ${code} ${desc}`);
-    logLine(`[renderer-load-failed] ${code} ${desc}`);
-  });
-  win.webContents.on('render-process-gone', (_e, details) => {
-    logLine(`[render-process-gone] ${JSON.stringify(details)}`);
-  });
+
+  if (SMOKE_MODE) {
+    // Surface renderer console warnings/errors on stdout for debugging.
+    win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+      if (level >= 2) {
+        console.log(`[renderer-console] ${sourceId}:${line} ${message}`);
+      }
+    });
+    win.webContents.on('did-fail-load', (_e, code, desc) => {
+      console.log(`[renderer-load-failed] ${code} ${desc}`);
+    });
+  }
 }
 
 /* -------------------------------------------------------------------- tray */
@@ -540,50 +378,17 @@ function refreshTrayMenu() {
       click: () => {
         if (!win) return;
         if (win.isVisible()) win.hide();
-        else win.showInactive();
+        else win.showInactive(); // re-showing never steals focus either
       },
     },
     {
-      label: 'Hide at left edge now',
-      click: () => {
-        if (win && !win.isDestroyed()) win.webContents.send('mochi:dock-now');
-      },
-    },
-    {
-      label: 'Auto-hide at left edge',
+      label: 'Sleep',
       type: 'checkbox',
-      checked: config.dockEnabled !== false,
-      click: (item) => {
-        config = deepMerge(config, { dockEnabled: item.checked });
-        persistConfig();
-        if (win && !win.isDestroyed()) win.webContents.send('mochi:config-changed', { ...config });
-      },
-    },
-    {
-      label: 'Reset position (bring Mochi back)',
+      checked: sleeping,
       click: () => {
-        if (!win) return;
-        forceOut();
-        const p = defaultPosition();
-        moveWindow(p.x, p.y);
-        win.show();
-        win.setAlwaysOnTop(true);
-        win.moveTop();
-      },
-    },
-    {
-      label: 'Use the screen my mouse is on',
-      click: () => {
-        if (!win) return;
-        const d = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-        config = deepMerge(config, { homeDisplayId: d.id });
-        persistConfig();
-        forceOut();
-        const p = defaultPosition();
-        moveWindow(p.x, p.y);
-        win.show();
-        win.setAlwaysOnTop(true);
-        win.moveTop();
+        sleeping = !sleeping;
+        if (win) win.webContents.send('mochi:sleep-toggle', { sleeping });
+        refreshTrayMenu();
       },
     },
     {
@@ -607,24 +412,254 @@ function createTray() {
   refreshTrayMenu();
 }
 
-/* ---------------------------------------------------------- global shortcut */
+/* --------------------------------------- panel hotkey (user-customizable) */
 
-function registerShortcut() {
+const DEFAULT_PANEL_HOTKEY = 'CmdOrCtrl+Shift+M';
+
+function currentPanelHotkey() {
+  const h =
+    config && typeof config.panelHotkey === 'string'
+      ? config.panelHotkey.trim()
+      : '';
+  return h || DEFAULT_PANEL_HOTKEY;
+}
+
+function onPanelHotkey() {
+  if (!win) return;
+  if (!win.isVisible()) {
+    win.showInactive();
+    windowVisible = true;
+    refreshTrayMenu();
+  }
+  win.webContents.send('mochi:toggle-panel');
+}
+
+// Register the panel hotkey. Returns true on success; false when Electron
+// rejects the accelerator (malformed, already taken, …).
+function registerPanelHotkey(accelerator) {
   try {
-    const ok = globalShortcut.register('CmdOrCtrl+Shift+M', () => {
-      if (!win) return;
-      if (!win.isVisible()) {
-        win.show();
-        windowVisible = true;
-        refreshTrayMenu();
-      }
-      win.focus();
-      win.moveTop();
-      win.webContents.send('mochi:toggle-panel');
-    });
-    if (!ok) console.error('[mochi] global shortcut registration failed');
+    const ok = globalShortcut.register(accelerator, onPanelHotkey);
+    if (!ok) console.error(`[mochi] global shortcut registration failed: ${accelerator}`);
+    return ok;
   } catch (err) {
     console.error('[mochi] globalShortcut error:', err.message);
+    return false;
+  }
+}
+
+// Applied once at launch. If the configured hotkey can't register, fall back
+// to the default so Mochi never launches without a working hotkey.
+function applyPanelHotkeyAtLaunch() {
+  const hotkey = currentPanelHotkey();
+  if (registerPanelHotkey(hotkey)) return;
+  if (hotkey !== DEFAULT_PANEL_HOTKEY && registerPanelHotkey(DEFAULT_PANEL_HOTKEY)) {
+    console.error(`[mochi] falling back to default panel hotkey ${DEFAULT_PANEL_HOTKEY}`);
+  }
+}
+
+/* ------------------------------------------------------------- tool bridge */
+
+const pendingApprovals = new Map(); // id -> { resolve, timer }
+
+// Renderer answers approval prompts via preload's respondApproval(id, approved).
+ipcMain.on('mochi:approval-response', (_e, resp) => {
+  if (!resp || typeof resp.id !== 'string') return;
+  const pending = pendingApprovals.get(resp.id);
+  if (!pending) return;
+  pendingApprovals.delete(resp.id);
+  clearTimeout(pending.timer);
+  pending.resolve(resp.approved === true);
+});
+
+// Ask the renderer to approve a non-read-only tool call. Resolves true when
+// the user approves; resolves false on deny or after a 60s timeout (default DENY).
+function requestApproval(sender, payload) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingApprovals.delete(payload.id);
+      resolve(false);
+    }, 60_000);
+    pendingApprovals.set(payload.id, { resolve, timer });
+    sender.send('mochi:tool-approval', payload);
+  });
+}
+
+let toolRequestCounter = 0;
+
+async function invokeTool(event, name, args) {
+  // electron/tools.cjs is written by another agent; require it lazily so the
+  // shell boots fine before the tool layer exists.
+  let tools;
+  try {
+    tools = require('./tools.cjs');
+  } catch (err) {
+    if (err && err.code === 'MODULE_NOT_FOUND' && String(err.message).includes('tools.cjs')) {
+      return { ok: false, error: 'tools not built yet' };
+    }
+    return { ok: false, error: `tool loader failed: ${(err && err.message) || err}` };
+  }
+
+  const toolName = String(name);
+  const toolArgs = args && typeof args === 'object' ? args : {};
+
+  // Primary interface (electron/tools.cjs):
+  //   invokeTool(name, args, ctx) with ctx = { root, requestApproval }.
+  // Read-only tools run directly inside the module; write/shell tools call
+  // back into main's requestApproval, which implements the spec'd flow:
+  // send `mochi:tool-approval` {id, tool, args, description, detail},
+  // await `mochi:approval-response` for that id, 60s timeout → default DENY.
+  if (typeof tools.invokeTool === 'function') {
+    const requestApprovalFn = (info = {}) =>
+      requestApproval(event.sender, {
+        id: `tool-${Date.now()}-${(toolRequestCounter += 1)}`,
+        tool: info.tool || toolName,
+        args: info.args || toolArgs,
+        description: info.description || `Run tool "${toolName}"`,
+        detail: info.detail || JSON.stringify(toolArgs, null, 2),
+      });
+    const root =
+      config.workingFolder && config.workingFolder.length > 0
+        ? config.workingFolder
+        : app.getAppPath();
+    try {
+      return await tools.invokeTool(toolName, toolArgs, {
+        root,
+        requestApproval: requestApprovalFn,
+      });
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  }
+
+  // Fallback: registry-style export (tools[name] or tools.get(name)). A tool
+  // is read-only only when its own metadata says so; anything else goes
+  // through the user-approval flow above (default deny).
+  const entry = typeof tools.get === 'function' ? tools.get(toolName) : tools[toolName];
+  if (entry == null) {
+    return { ok: false, error: `unknown tool: ${toolName}` };
+  }
+
+  const readOnly =
+    (typeof entry === 'object' && entry !== null && entry.readOnly === true) ||
+    (typeof tools.isReadOnly === 'function' && tools.isReadOnly(toolName)) ||
+    (Array.isArray(tools.readOnly) && tools.readOnly.includes(toolName)) ||
+    (Array.isArray(tools.READ_ONLY) && tools.READ_ONLY.includes(toolName));
+
+  if (!readOnly) {
+    const approved = await requestApproval(event.sender, {
+      id: `tool-${Date.now()}-${(toolRequestCounter += 1)}`,
+      tool: toolName,
+      args: toolArgs,
+      description:
+        (typeof entry === 'object' && entry !== null && entry.description) ||
+        `Run tool "${toolName}"`,
+      detail:
+        (typeof entry === 'object' && entry !== null && entry.detail) ||
+        JSON.stringify(toolArgs, null, 2),
+    });
+    if (!approved) return { ok: false, denied: true };
+  }
+
+  const fn =
+    typeof entry === 'function'
+      ? entry
+      : entry.run ||
+        entry.invoke ||
+        entry.fn ||
+        (typeof tools.invoke === 'function' ? (a) => tools.invoke(toolName, a) : null);
+  if (typeof fn !== 'function') {
+    return { ok: false, error: `tool has no runnable entry: ${toolName}` };
+  }
+
+  try {
+    const result = await fn(toolArgs);
+    return { ok: true, result: result === undefined ? null : result };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+/* ---------------------------------------------------- auto-update (opt-in) */
+
+/*
+ * AUTO-UPDATE CONTRACT — wired in Phase A, Settings UI owned by Phase E.
+ *
+ *   Config key: `autoUpdate` (boolean, default false).
+ *   Bridge (preload, window.mochi):
+ *     mochi.getAutoUpdate()        -> Promise<boolean>
+ *     mochi.setAutoUpdate(enabled) -> Promise<{ ok, autoUpdate }> (applies immediately)
+ *     mochi.checkForUpdatesNow()   -> Promise<{ ok, skipped? }>
+ *     (checkForUpdatesNow is a no-op { ok: true, skipped: true } unless
+ *      the user has opted in — and never runs in --smoke mode.)
+ *
+ * Privacy: default false means ZERO network calls for updates. The
+ * electron-updater module is only required when the user opts in.
+ * When enabled: check at launch, re-check every 6h, auto-download,
+ * then ask via a dialog before quit-and-install. Updates are published
+ * to GitHub Releases (see package.json "build.publish").
+ */
+
+let updater = null; // the electron-updater autoUpdater instance, once loaded
+let updateCheckTimer = null;
+
+function stopAutoUpdateChecks() {
+  if (updateCheckTimer) {
+    clearInterval(updateCheckTimer);
+    updateCheckTimer = null;
+  }
+}
+
+function startAutoUpdater() {
+  if (updater) return; // already running
+  let autoUpdater;
+  try {
+    autoUpdater = require('electron-updater').autoUpdater;
+  } catch (err) {
+    console.error('[mochi] electron-updater failed to load:', err.message);
+    return;
+  }
+  autoUpdater.autoDownload = true;
+
+  autoUpdater.on('update-downloaded', () => {
+    const { dialog } = require('electron');
+    const choice = dialog.showMessageBoxSync({
+      type: 'info',
+      buttons: ['Install and restart', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      title: 'Mochi update ready',
+      message: 'A new version of Mochi has been downloaded.',
+      detail: 'Install it now? Mochi will restart.',
+    });
+    if (choice === 0) autoUpdater.quitAndInstall(false, true);
+  });
+  autoUpdater.on('error', (err) => {
+    console.error('[mochi] auto-update error:', (err && err.message) || err);
+  });
+
+  updater = autoUpdater;
+  updater
+    .checkForUpdates()
+    .catch((err) => console.error('[mochi] update check failed:', err.message));
+  updateCheckTimer = setInterval(
+    () => {
+      updater
+        .checkForUpdates()
+        .catch((err) => console.error('[mochi] update check failed:', err.message));
+    },
+    6 * 60 * 60 * 1000
+  );
+}
+
+// Called at launch and whenever the config changes. Only starts the updater
+// when the user has opted in; never in smoke mode.
+function applyAutoUpdateSetting() {
+  if (SMOKE_MODE) return;
+  if (config.autoUpdate === true) {
+    startAutoUpdater();
+  } else {
+    stopAutoUpdateChecks();
+    updater = null;
   }
 }
 
@@ -638,65 +673,71 @@ function registerIpc() {
       config = deepMerge(config, patch);
       persistConfig();
       applyLoginItemSetting();
+      applyAutoUpdateSetting();
+      // Notify the renderer so live settings (scale, sounds, peek) apply.
       if (win && !win.isDestroyed()) win.webContents.send('mochi:config-changed', { ...config });
     }
     return { ...config };
   });
 
-  ipcMain.handle('mochi:get-position', () => {
-    if (win && !win.isDestroyed()) {
-      const [x, y] = win.getPosition();
-      return { x, y };
-    }
-    return loadPosition();
+  // Auto-update bridge (contract documented in the section above).
+  ipcMain.handle('mochi:get-auto-update', () => !!config.autoUpdate);
+
+  ipcMain.handle('mochi:set-auto-update', (_e, enabled) => {
+    config = deepMerge(config, { autoUpdate: !!enabled });
+    persistConfig();
+    applyAutoUpdateSetting();
+    // Keep the renderer's config snapshot in sync (same as set-config).
+    if (win && !win.isDestroyed()) win.webContents.send('mochi:config-changed', { ...config });
+    return { ok: true, autoUpdate: !!config.autoUpdate };
   });
+
+  // Customizable panel hotkey (Settings record-combo control). Validates by
+  // actually registering: on failure the OLD hotkey is re-registered and the
+  // error is returned so Settings can surface it. The app is never left
+  // without a working hotkey.
+  ipcMain.handle('mochi:set-panel-hotkey', (_e, accelerator) => {
+    const next = typeof accelerator === 'string' ? accelerator.trim() : '';
+    const prev = currentPanelHotkey();
+    if (!next) {
+      return { ok: false, hotkey: prev, error: 'Empty hotkey — nothing changed.' };
+    }
+    if (next === prev) return { ok: true, hotkey: prev };
+    globalShortcut.unregister(prev);
+    if (!registerPanelHotkey(next)) {
+      // Roll back: re-register the old hotkey so a working one always exists.
+      registerPanelHotkey(prev);
+      return {
+        ok: false,
+        hotkey: prev,
+        error: `Could not register "${next}" — kept ${prev}.`,
+      };
+    }
+    config = deepMerge(config, { panelHotkey: next });
+    persistConfig();
+    return { ok: true, hotkey: next };
+  });
+
+  ipcMain.handle('mochi:check-for-updates-now', async () => {
+    if (SMOKE_MODE || config.autoUpdate !== true || !updater) {
+      return { ok: true, skipped: true };
+    }
+    try {
+      await updater.checkForUpdates();
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
+  ipcMain.handle('mochi:get-position', () => loadPosition());
 
   ipcMain.on('mochi:save-position', (_e, pos) => {
     if (pos && typeof pos === 'object' && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
-      const p = moveWindow(pos.x, pos.y);
-      if (p) savePositionDebounced(p.x, p.y);
+      // Drag: move the window live (persistence stays debounced below).
+      if (win) win.setPosition(Math.round(pos.x), Math.round(pos.y));
+      savePositionDebounced(pos.x, pos.y);
     }
-  });
-
-  // Safe roaming range (window x/y) for the wander controller: dog fully visible.
-  ipcMain.handle('mochi:get-dock-geometry', () => dockGeometry());
-  ipcMain.handle('mochi:glide', (_e, t) => {
-    const x = Number(t && t.x);
-    const y = Number(t && t.y);
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
-    const ms = Math.min(6000, Math.max(250, Number(t.ms) || 1000));
-    return glideTo(Math.round(x), Math.round(y), ms);
-  });
-  ipcMain.on('mochi:cancel-glide', () => cancelGlide());
-  ipcMain.on('mochi:set-docked', (_e, v) => {
-    docked = !!v;
-  });
-  ipcMain.handle('mochi:get-wander-bounds', () => posBounds(false));
-
-  // Chat panel opened/closed: when opening, nudge the window so the whole panel is visible.
-  ipcMain.on('mochi:panel-open', (_e, open) => {
-    panelOpen = !!open;
-    if (panelOpen && docked) {
-      cancelGlide();
-      docked = false; // opening chat (e.g. hotkey) while hidden brings the dog out
-    }
-    if (panelOpen) reclampWindow();
-  });
-
-  ipcMain.handle('mochi:get-displays', () => {
-    return screen.getAllDisplays().map((d) => ({
-      id: d.id,
-      bounds: d.bounds,
-      workArea: d.workArea,
-    }));
-  });
-
-  ipcMain.handle('mochi:get-screen-size', () => {
-    const primary = screen.getPrimaryDisplay();
-    return {
-      width: primary.workArea.width,
-      height: primary.workArea.height,
-    };
   });
 
   ipcMain.on('mochi:ignore-mouse', (_e, ignore) => {
@@ -721,21 +762,35 @@ function registerIpc() {
   });
 
   ipcMain.on('mochi:quit', () => app.quit());
+
+  ipcMain.handle('mochi:invoke-tool', (event, name, args) => invokeTool(event, name, args));
 }
 
 /* --------------------------------------------------------------- lifecycle */
 
+// A second launch exits at the single-instance check above; the running
+// instance restores and focuses its window here instead of launching another.
+app.on('second-instance', () => {
+  if (win && !win.isDestroyed()) {
+    if (!win.isVisible()) {
+      win.showInactive();
+      windowVisible = true;
+      refreshTrayMenu();
+    }
+    win.focus();
+  }
+});
+
 app.whenReady().then(() => {
   registerIpc();
   createWindow();
-  screen.on('display-added', reclampWindow);
-  screen.on('display-removed', reclampWindow);
-  screen.on('display-metrics-changed', reclampWindow);
   createTray();
-  registerShortcut();
+  applyPanelHotkeyAtLaunch();
   applyLoginItemSetting();
+  applyAutoUpdateSetting();
 });
 
+// Stay alive in the tray when the window is hidden/closed; quit via tray menu.
 app.on('window-all-closed', () => {});
 
 app.on('before-quit', () => {

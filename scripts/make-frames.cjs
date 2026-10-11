@@ -297,6 +297,11 @@ function drawDogFront(g, o) {
     px(g, hx - 5, ty2, 'B'); px(g, hx - 5, ty2 + 1, 'B');
   }
 
+  /* droplets: effectBlue spray pixels, e.g. sneeze/shake spray */
+  if (o.droplets) {
+    for (const [qx, qy] of o.droplets) px(g, qx + dx, qy + dy, 'B');
+  }
+
   /* think: paw up to chin (drawn over head) */
   if (o.chin) eBlob(g, hx + 5, hy + 5 + o.chin, 2, 2, 'W');
 
@@ -585,6 +590,38 @@ const ANIMS = [
     { dy: -6, legs: 'tuck', tail: 'up' },
     { squash: 3 },
     { squash: 1 },
+  ]},
+  { name: 'sneeze', timing: [130, 170, 240], draw: 'front', frames: [
+    // pre-sneeze scrunch: eyes squeezed, head dips
+    { eye: 'squint', headDY: 1, earL: 'flat', earR: 'flat', mouth: 'flat' },
+    // achoo! head lunges down-forward, mouth open, spray flies
+    { eye: 'closed', headDY: 3, headDX: 1, mouth: 'open',
+      earL: 'flat', earR: 'flat',
+      droplets: [[14, 22], [18, 23], [16, 25], [20, 21]] },
+    // relieved: happy eyes, back to rest
+    { eye: 'happy', mouth: 'smile' },
+  ]},
+  { name: 'shake', timing: [110, 110, 230], draw: 'front', frames: [
+    // shake-off, flung left: whole dog skews, ears fly, droplets spray left
+    { dx: -1, headDX: -2, earL: 'flat', earR: 'droop', eye: 'squint',
+      mouth: 'flat', droplets: [[5, 12], [3, 16], [6, 20], [2, 13]] },
+    // flung right (mirror energy)
+    { dx: 1, headDX: 2, earL: 'droop', earR: 'flat', eye: 'squint',
+      mouth: 'flat', droplets: [[27, 12], [29, 16], [26, 20], [30, 13]] },
+    // settled: happy tongue-out shake-off complete
+    { eye: 'happy', mouth: 'tongue', blush: true },
+  ]},
+  { name: 'tail-chase', timing: [150, 150, 150, 170], draw: 'front', frames: [
+    // spots the tail: head swings right toward it
+    { headDX: 2, eyeDX: 1, noseDX: 1, tail: 'wagR', mouth: 'smile' },
+    // lunges right: body pivots, mouth open, tail up
+    { dx: 1, headDX: 2, eyeDX: 1, noseDX: 2, tail: 'up', mouth: 'open',
+      earL: 'perk', earR: 'perk' },
+    // tail swings left: head whips after it
+    { headDX: -2, eyeDX: -1, noseDX: -1, tail: 'wagL', mouth: 'smile' },
+    // lunges left
+    { dx: -1, headDX: -2, eyeDX: -1, noseDX: -2, tail: 'up', mouth: 'open',
+      earL: 'perk', earR: 'perk' },
   ]},
   { name: 'peek', draw: 'peek', frames: [
     { dx: 6 }, { dx: 9 }, { dx: 7 },
