@@ -1,9 +1,24 @@
 {
-  "provider": "groq",
-  "scale": 4,
-  "userName": "",
-  "wanderEnabled": true,
+  "autoUpdate": false,
   "calmMode": false,
+  "openAtLogin": false,
+  "panelHotkey": "CmdOrCtrl+Shift+M",
+  "peekMode": false,
+  "pomodoro": {
+    "breakMinutes": 5,
+    "enabled": false,
+    "focusMinutes": 25
+  },
+  "provider": "groq",
+  "reminders": {
+    "intervalMinutes": 45,
+    "stretch": true,
+    "water": true
+  },
+  "scale": 4,
   "sleepAfterMinutes": 5,
-  "openAtLogin": false
+  "soundsEnabled": false,
+  "userName": "",
+  "workingFolder": "",
+  "wanderEnabled": true
 }
