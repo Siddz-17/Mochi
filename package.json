@@ -1,35 +1,53 @@
 {
-  "name": "mochi",
-  "version": "0.1.0",
-  "description": "Mochi — a vector white Japanese dog desktop companion and chatbot.",
-  "main": "electron/main.cjs",
-  "type": "module",
-  "scripts": {
-    "start": "electron .",
-    "smoke": "node scripts/smoke.cjs",
-    "build:sprites": "node scripts/build-sprites.cjs",
-    "dist": "electron-builder --win dir",
-    "dist:portable": "electron-builder --win portable"
+  "build": {
+    "appId": "com.mochi.desktop",
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "assets/**/*",
+      "mochi.config.json",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ]
+    },
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "productName": "Mochi",
+    "publish": {
+      "owner": "Siddz-17",
+      "provider": "github",
+      "repo": "Mochi"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    }
   },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  },
+  "description": "Mochi \u2014 a pixel-dog desktop companion that lives on your screen.",
   "devDependencies": {
     "electron": "^44.7.0",
     "electron-builder": "^26.15.3"
   },
-  "build": {
-    "appId": "com.mochi.desktop",
-    "productName": "Mochi",
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "assets/**/*",
-      "electron/**/*",
-      "src/**/*",
-      "mochi.config.json",
-      "package.json"
-    ],
-    "win": {
-      "target": "dir"
-    }
-  }
+  "main": "electron/main.cjs",
+  "name": "mochi",
+  "scripts": {
+    "build:sprites": "node scripts/build-sprites.cjs",
+    "dist": "electron-builder",
+    "smoke": "node scripts/smoke.cjs",
+    "start": "electron ."
+  },
+  "type": "module",
+  "version": "0.2.0"
 }
