@@ -1,8 +1,4 @@
-/* ============================================================
-   Mochi — Pixel Dog Companion Styles
-   System fonts only (no webfonts, no network).
-   Pixel-art canvas + modern speech-bubble chatbot.
-   ============================================================ */
+/* Mochi pixel UI — system fonts only (no webfonts, no network). */
 
 :root {
   --ink: #3a3f4a;      /* dark-gray outline color */
@@ -14,34 +10,31 @@
   box-sizing: border-box;
 }
 
-html, body {
+html,
+body {
   margin: 0;
   padding: 0;
   width: 100%;
   height: 100%;
   overflow: hidden;
   background: transparent;
-  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-family: "Courier New", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--ink);
   user-select: none;
   -webkit-user-select: none;
 }
 
 .hidden {
-  display: none !important;
+  display: none;
 }
 
-/* ============================================================
-   STAGE (Canvas dog + effects)
-   ============================================================ */
+/* ------------------------------------------------------------------ stage */
 
 #stage {
   position: fixed;
-  right: 16px;
-  bottom: 16px;
-  width: 128px;
-  height: 128px;
-  cursor: pointer;
+  inset: 0;
+  /* Frameless-window drag lives on the stage; interactive UI opts out below. */
+  -webkit-app-region: drag;
 }
 
 #dog-canvas {
@@ -56,213 +49,728 @@ html, body {
 #effects-layer {
   position: absolute;
   inset: 0;
-  overflow: visible;
+  overflow: hidden;
   pointer-events: none;
 }
 
-/* Dots effect element */
-.mochi-dots {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  font-family: monospace;
-  font-size: 16px;
-  font-weight: bold;
-  color: var(--ink);
-  pointer-events: none;
-}
-
-/* ============================================================
-   CHAT PANEL (Speech bubble anchored above the dog)
-   ============================================================ */
+/* ------------------------------------------------------------------ panel
+   Chat panel: speech bubble anchored bottom-left, near the dog. */
 
 #panel {
   position: fixed;
-  right: 16px;
-  bottom: 160px;
-  width: 320px;
-  max-height: 400px;
+  left: 16px;
+  bottom: 16px;
+  width: 300px;
+  max-height: 340px;
   display: flex;
   flex-direction: column;
   background: var(--paper);
-  border: 2px solid var(--ink);
-  border-radius: 14px;
-  box-shadow: 0 4px 24px rgba(58, 63, 74, 0.18), 0 1px 4px rgba(0,0,0,0.08);
-  font-size: 13.5px;
-  line-height: 1.5;
+  border: 4px solid var(--ink);
+  border-radius: 4px;
+  box-shadow: 6px 6px 0 var(--ink);
+  -webkit-app-region: no-drag;
+  font-size: 13px;
+  line-height: 1.4;
   z-index: 10;
-  overflow: hidden;
-  animation: panel-pop 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-@keyframes panel-pop {
-  from { opacity: 0; transform: translateY(10px) scale(0.96); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-#panel.hidden,
-#panel[hidden] {
-  display: none !important;
-}
-
-/* Speech-bubble tail pointing down to dog */
+/* Speech-bubble tail pointing down-left toward the dog. */
 #panel::after {
   content: "";
   position: absolute;
-  right: 48px;
-  bottom: -9px;
-  width: 16px;
-  height: 16px;
+  left: 52px;
+  bottom: -15px;
+  width: 18px;
+  height: 18px;
   background: var(--paper);
-  border-right: 2px solid var(--ink);
-  border-bottom: 2px solid var(--ink);
-  transform: rotate(45deg);
-  border-radius: 0 0 3px 0;
+  border-right: 4px solid var(--ink);
+  border-bottom: 4px solid var(--ink);
+  transform: rotate(45deg) skew(10deg, 10deg);
 }
 
-/* --- Panel header --- */
-#panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 14px;
-  border-bottom: 1px solid rgba(58, 63, 74, 0.12);
-  background: linear-gradient(135deg, var(--accent) 0%, #fcc8d4 100%);
-  border-radius: 12px 12px 0 0;
-}
-
-#panel-header h3 {
-  margin: 0;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--ink);
-  letter-spacing: 0.3px;
-}
-
-#panel-header button {
-  background: none;
-  border: none;
-  font-size: 15px;
-  cursor: pointer;
-  color: var(--ink);
-  opacity: 0.6;
-  padding: 2px 6px;
-  border-radius: 4px;
-  transition: opacity 0.15s ease, background 0.15s ease;
-}
-
-#panel-header button:hover {
-  opacity: 1;
-  background: rgba(255, 255, 255, 0.5);
-}
-
-/* --- Messages --- */
 #messages {
   flex: 1;
-  min-height: 120px;
-  max-height: 280px;
+  min-height: 110px;
   overflow-y: auto;
-  padding: 12px 14px;
+  padding: 10px;
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-#messages::-webkit-scrollbar {
-  width: 4px;
-}
-#messages::-webkit-scrollbar-thumb {
-  background: rgba(58, 63, 74, 0.2);
-  border-radius: 4px;
-}
-
-.mochi-msg {
-  max-width: 92%;
-  padding: 8px 12px;
-  border-radius: 12px;
-  font-size: 13px;
-  line-height: 1.45;
-  word-break: break-word;
-  animation: msg-appear 0.25s ease-out;
+#quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 10px 8px;
 }
 
-@keyframes msg-appear {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.mochi-msg-user {
-  align-self: flex-end;
-  background: var(--ink);
-  color: var(--paper);
-  border-bottom-right-radius: 4px;
-}
-
-.mochi-msg-assistant {
-  align-self: flex-start;
-  background: #f4f3f0;
+#quick-actions button {
+  font: inherit;
+  background: var(--accent);
   color: var(--ink);
-  border-bottom-left-radius: 4px;
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--ink);
+  padding: 4px 8px;
+  cursor: pointer;
 }
 
-/* --- Chat form & input --- */
+#quick-actions button:active {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
 #chat-form {
   display: flex;
   gap: 6px;
-  padding: 8px 12px 10px;
-  border-top: 1px solid rgba(58, 63, 74, 0.1);
-  background: var(--paper);
+  padding: 0 10px 8px;
 }
 
 #chat-input {
   flex: 1;
   min-width: 0;
   font: inherit;
-  font-size: 13px;
-  background: #f4f3f0;
+  background: #ffffff;
   color: var(--ink);
-  border: 1.5px solid transparent;
-  border-radius: 20px;
-  padding: 8px 14px;
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  padding: 6px 8px;
   outline: none;
   user-select: text;
   -webkit-user-select: text;
-  transition: border-color 0.2s ease, background 0.2s ease;
 }
 
 #chat-input:focus {
-  background: #fff;
-  border-color: var(--accent);
+  background: var(--paper);
 }
 
 #chat-send {
   font: inherit;
   background: var(--ink);
   color: var(--paper);
-  border: none;
-  border-radius: 50%;
-  width: 34px;
-  height: 34px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--accent);
+  padding: 4px 10px;
   cursor: pointer;
-  transition: transform 0.15s ease, background 0.15s ease;
-  flex-shrink: 0;
-}
-
-#chat-send:hover {
-  background: #555;
 }
 
 #chat-send:active {
-  transform: scale(0.9);
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0 var(--accent);
 }
 
-/* --- Status line --- */
+#approval-area {
+  padding: 0 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 #status-line {
-  padding: 4px 14px 6px;
-  font-size: 10.5px;
-  color: rgba(58, 63, 74, 0.5);
-  text-align: center;
+  border-top: 3px solid var(--ink);
+  background: var(--accent);
+  padding: 6px 10px;
+  font-size: 11px;
+  min-height: 18px;
+}
+
+/* ---------------------------------------------------------------- settings */
+
+#settings {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  width: 320px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: var(--paper);
+  border: 4px solid var(--ink);
+  border-radius: 4px;
+  box-shadow: 6px 6px 0 var(--ink);
+  -webkit-app-region: no-drag;
+  padding: 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  z-index: 20;
+}
+
+#settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* --------------------------------------------------------------- badge
+   Small badge pinned near the panel's top-right corner; shown while a
+   tool approval is waiting for the user. */
+
+#panel-badge {
+  position: fixed;
+  left: 298px;
+  bottom: 338px;
+  width: 20px;
+  height: 20px;
+  background: var(--accent);
+  border: 3px solid var(--ink);
+  border-radius: 50%;
+  box-shadow: 3px 3px 0 var(--ink);
+  -webkit-app-region: no-drag;
+  z-index: 30;
+}
+
+/* Pixel speech bubble used by extras (pomodoro, reminders) when the effects
+   module has no text-bubble API. Kept in CSS (not JS cssText) so the strict
+   style-src CSP is honored. */
+.mochi-bubble {
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  transform: translateX(-50%);
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: var(--paper, #fdfdf6);
+  color: var(--ink, #3a3f4a);
+  border: 3px solid var(--ink, #3a3f4a);
+  box-shadow: 4px 4px 0 rgba(58, 63, 74, 0.25);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 50;
+  pointer-events: none;
+}
+
+/* Pomodoro chip (created by src/extras/pomodoro.js). Shown/hidden by toggling
+   style.display; all static styling lives here for CSP compliance. */
+.mochi-pomodoro {
+  position: absolute;
+  left: 50%;
+  bottom: 6px;
+  transform: translateX(-50%);
+  display: none;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--paper, #fdfdf6);
+  color: var(--ink, #3a3f4a);
+  border: 3px solid var(--ink, #3a3f4a);
+  box-shadow: 3px 3px 0 rgba(58, 63, 74, 0.25);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  cursor: pointer;
+  user-select: none;
+  z-index: 40;
+  image-rendering: pixelated;
+}
+.mochi-pomodoro-label {
+  color: var(--accent, #f7a8b8);
+}
+
+/* Working-state progress dots under the dog (src/renderer/dog.js). */
+.mochi-dots {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 0;
+  pointer-events: none;
+  display: none;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1;
+  color: #fff;
+  text-shadow: 1px 1px 0 #000;
+}
+
+/* ------------------------------------------------------- panel tools
+   Small action row under quick actions: stop / regenerate / export
+   (src/renderer/panel.js). */
+
+#panel-tools {
+  display: flex;
+  gap: 6px;
+  padding: 0 10px 8px;
+}
+
+.mochi-tool-btn {
+  font: inherit;
+  font-size: 11px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.mochi-tool-btn:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: 0 0 0 var(--ink);
+}
+
+.mochi-tool-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ------------------------------------------------------- chat messages
+   Pixel speech bubbles; assistant bodies render markdown (mochi-md). */
+
+.mochi-msg {
+  display: flex;
+}
+
+.mochi-msg-user {
+  justify-content: flex-end;
+}
+
+.mochi-msg-assistant {
+  justify-content: flex-start;
+}
+
+.mochi-msg-user .mochi-msg-body {
+  background: var(--accent);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--ink);
+  padding: 6px 8px;
+  max-width: 92%;
+}
+
+.mochi-msg-assistant .mochi-msg-body {
+  background: #ffffff;
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--ink);
+  padding: 6px 8px;
+  max-width: 100%;
+}
+
+/* ------------------------------------------------------- markdown
+   Rendered by src/renderer/markdown.js; all content is HTML-escaped
+   before token rules run, so innerHTML here is safe. */
+
+.mochi-md {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.mochi-md-p {
+  margin: 0 0 6px;
+}
+
+.mochi-md-p:last-child {
+  margin-bottom: 0;
+}
+
+.mochi-md-h {
+  margin: 8px 0 4px;
+  line-height: 1.3;
+}
+
+h1.mochi-md-h {
+  font-size: 15px;
+  border-bottom: 3px solid var(--ink);
+  padding-bottom: 2px;
+}
+
+h2.mochi-md-h {
+  font-size: 14px;
+}
+
+h3.mochi-md-h {
+  font-size: 13px;
+}
+
+.mochi-md-code {
+  background: #efece2;
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  padding: 0 3px;
+  font-size: 12px;
+}
+
+.mochi-md-list {
+  margin: 4px 0 8px;
+  padding-left: 18px;
+}
+
+.mochi-md-list li {
+  margin-bottom: 2px;
+}
+
+.mochi-md a {
+  color: #2b6cb0;
+}
+
+.mochi-codeblock {
+  position: relative;
+  background: #2e3138;
+  color: #f2f0e6;
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--ink);
+  padding: 22px 8px 8px;
+  overflow-x: auto;
+  font-size: 12px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.mochi-codeblock code {
+  font-family: inherit;
+  white-space: pre;
+}
+
+.mochi-code-lang {
+  position: absolute;
+  top: 4px;
+  left: 8px;
+  font-size: 10px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.mochi-copy-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font: inherit;
+  font-size: 10px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.4);
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+.mochi-copy-btn:active {
+  transform: translate(1px, 1px);
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------- tool results
+   Rich tool-result blocks (src/renderer/toolResults.js): collapsible
+   unified diffs with per-file sections, truncation show more/less,
+   and copy buttons. Palette stays pixel: ink borders, hard shadows,
+   pastel green/red tints for +/- lines. */
+
+:root {
+  --plus-bg: #dff0dc;   /* pastel green tint for added lines */
+  --plus-ink: #2e7d32;
+  --minus-bg: #f6dcdc;  /* pastel red tint for removed lines */
+  --minus-ink: #a63a3a;
+  --hunk-bg: #efe9dc;   /* parchment for hunk headers */
+  --tr-ok: #2e7d32;
+  --tr-err: #a63a3a;
+}
+
+.mochi-tool-result {
+  font-size: 11px;
+}
+
+.tr-wrap {
+  background: var(--paper);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  box-shadow: 3px 3px 0 var(--ink);
+  max-width: 100%;
+  overflow: hidden;
+}
+
+.tr-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  background: var(--hunk-bg);
+  border-bottom: 2px solid var(--ink);
+}
+
+.tr-status {
+  font-weight: bold;
+  white-space: nowrap;
+}
+
+.tr-ok {
+  color: var(--tr-ok);
+}
+
+.tr-err {
+  color: var(--tr-err);
+}
+
+.tr-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.tr-toggle,
+.tr-copy,
+.tr-showmore,
+.tr-diff-head {
+  font: inherit;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tr-toggle {
+  background: var(--paper);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 0 5px;
+  line-height: 1.4;
+}
+
+.tr-toggle:active {
+  transform: translate(1px, 1px);
+  box-shadow: none;
+}
+
+.tr-copy {
+  background: var(--paper);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 0 6px;
+  line-height: 1.4;
+}
+
+.tr-copy:active {
+  transform: translate(1px, 1px);
+  box-shadow: none;
+}
+
+.tr-body {
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tr-pre {
+  margin: 0;
+  padding: 6px;
+  background: #ffffff;
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  user-select: text;
+  -webkit-user-select: text;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.tr-showmore {
+  align-self: flex-start;
+  background: var(--accent);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 2px 8px;
+}
+
+.tr-showmore:active {
+  transform: translate(1px, 1px);
+  box-shadow: none;
+}
+
+.tr-diff-file {
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.tr-diff-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: var(--hunk-bg);
+  color: var(--ink);
+  border: 0;
+  border-bottom: 2px solid var(--ink);
+  padding: 3px 6px;
+}
+
+.tr-diff-head:last-child {
+  border-bottom: 0;
+}
+
+.tr-arrow {
+  font-size: 10px;
+}
+
+.tr-filename {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: bold;
+}
+
+.tr-counts {
+  font-size: 10px;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.tr-diff-lines {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  max-height: 220px;
+}
+
+.tr-add {
+  background: var(--plus-bg);
+  color: var(--plus-ink);
+  display: inline-block;
+  min-width: 100%;
+}
+
+.tr-del {
+  background: var(--minus-bg);
+  color: var(--minus-ink);
+  display: inline-block;
+  min-width: 100%;
+}
+
+.tr-hunk {
+  background: var(--hunk-bg);
+  font-weight: bold;
+  display: inline-block;
+  min-width: 100%;
+}
+
+.tr-meta {
+  opacity: 0.75;
+  display: inline-block;
+  min-width: 100%;
+}
+
+.tr-ctx {
+  display: inline-block;
+  min-width: 100%;
+}
+
+/* ------------------------------------------------------------------ onboarding (Phase C)
+   First-run welcome bubble: pixel-styled speech bubble near the dog.
+   Static styling lives here for CSP (no inline styles in markup). */
+
+.mochi-onboarding {
+  position: fixed;
+  z-index: 40;
+  width: 264px;
+  background: var(--paper);
+  border: 3px solid var(--ink);
+  border-radius: 6px;
+  box-shadow: 4px 4px 0 var(--ink);
+  padding: 10px 12px 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink);
+  -webkit-app-region: no-drag;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* speech tail pointing left, toward the dog */
+.mochi-onboarding::before {
+  content: '';
+  position: absolute;
+  left: -8px;
+  top: 22px;
+  width: 10px;
+  height: 10px;
+  background: var(--paper);
+  border-left: 3px solid var(--ink);
+  border-bottom: 3px solid var(--ink);
+  transform: rotate(45deg);
+}
+
+.mob-title {
+  font-weight: bold;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.mob-body {
+  margin-bottom: 8px;
+}
+
+.mob-name {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: #fff;
+  border: 2px solid var(--ink);
+  border-radius: 4px;
+  padding: 4px 8px;
+  margin-bottom: 8px;
+  outline: none;
+}
+
+.mob-name:focus {
+  border-color: var(--accent);
+}
+
+.mob-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mob-skip,
+.mob-next {
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  background: var(--paper);
+  color: var(--ink);
+  border: 2px solid var(--ink);
+  border-radius: 4px;
+  padding: 3px 10px;
+  box-shadow: 2px 2px 0 var(--ink);
+}
+
+.mob-skip:active,
+.mob-next:active {
+  transform: translate(2px, 2px);
+  box-shadow: none;
+}
+
+.mob-next {
+  margin-left: auto;
+  background: var(--accent);
+  font-weight: bold;
+}
+
+.mob-dots {
+  font-size: 10px;
+  letter-spacing: 2px;
+  opacity: 0.7;
 }

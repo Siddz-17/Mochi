@@ -1,213 +1,167 @@
 /**
  * @module renderer/panel
  *
- * Chat panel for Mochi: speech-bubble style, streaming message list,
- * chat history in localStorage, and dog companion responses.
+ * Chat panel for Mochi: streaming message list, quick actions, history,
+ * approval cards, and status line. Owns the `tools` adapter handed to the
+ * provider's `send()`:
+ *   - invokeTool(name, args) → bridge.invokeTool (main runs tools.cjs).
+ *     Read-only tools run immediately; write/shell tools are challenged by
+ *     main via `mochi:tool-approval`, which arrives here through
+ *     bridge.onToolApprovalRequest. To avoid double-prompting when the
+ *     panel already approved in-panel (mock demo flow), a recent in-panel
+ *     approval for the same tool+args auto-answers the main challenge.
+ *   - requestApproval(info) → renders a card into #approval-area.
  */
 
 import { MochiState, isAgentBusy } from '../state/mochiState.js';
+import { renderApprovalCard } from '../tools/approval.js';
+import { renderMarkdown, attachCopyButtons } from './markdown.js';
+import { createToolResultElement, getToolExport } from './toolResults.js';
+
+// Mirrors electron/tools.cjs READ_ONLY. Kept local: the renderer cannot
+// require() the main-side CJS module (context isolation).
+const READ_ONLY_TOOLS = new Set([
+  'files.list',
+  'files.read',
+  'files.search',
+  'git.status',
+  'git.diff',
+  'git.log',
+]);
 
 const HISTORY_KEY = 'mochi.chat.history';
-const HISTORY_CAP = 60;
+const HISTORY_CAP = 100;
+const PROVIDER_HISTORY = 20;
+const PRE_APPROVAL_TTL_MS = 120000;
 
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = String(s);
-  return d.innerHTML;
+const QUICK_ACTIONS = [
+  'Explain this repo',
+  'What changed recently?',
+  'Find a bug',
+  'Write tests for…',
+  'Review my diff',
+];
+
+function approvalKey(tool, args) {
+  return `${tool}:${JSON.stringify(args || {})}`;
 }
 
-export function createPanel(rootEl, deps = {}) {
-  const { registry, bridge = {}, dog, getConfig = () => ({}) } = deps;
+function esc(s) {
+  return String(s);
+}
+
+/**
+ * @param {HTMLElement} rootEl  The #panel element.
+ * @param {{registry: {loadProvider: (id: string) => any}, bridge: any, dog?: {setAgentState?: (s: string) => void}, getConfig: () => any}} deps
+ */
+export function createPanel(rootEl, deps) {
+  const { registry, bridge, dog, getConfig } = deps;
 
   const messagesEl = rootEl.querySelector('#messages');
   const form = rootEl.querySelector('#chat-form');
   const input = rootEl.querySelector('#chat-input');
+  const approvalArea = rootEl.querySelector('#approval-area');
   const statusLine = rootEl.querySelector('#status-line');
-  const clearBtn = rootEl.querySelector('#chat-clear');
-  const closeBtn = rootEl.querySelector('#chat-close');
+  const quickRow = rootEl.querySelector('#quick-actions');
+  const badge = rootEl.querySelector('#panel-badge');
+  const stopBtn = rootEl.querySelector('#chat-stop');
+  const regenBtn = rootEl.querySelector('#chat-regen');
+  const exportBtn = rootEl.querySelector('#chat-export');
 
   let isOpen = false;
   let busy = false;
   let controller = null;
   let provider = null;
+  let providerError = null;
+  let cfg = {};
   let history = loadHistory();
+  let lastUserText = '';
+  const preApproved = new Map(); // approvalKey -> timestamp
 
-  function loadHistory() {
-    try {
-      const raw = localStorage.getItem(HISTORY_KEY);
-      if (raw) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr)) return arr.slice(-HISTORY_CAP);
-      }
-    } catch {}
-    return [];
-  }
-
-  function saveHistory() {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(-HISTORY_CAP)));
-    } catch {}
-  }
+  /* ---------- setup ---------- */
 
   function ensureProvider() {
-    if (provider) return provider;
-    const cfg = typeof getConfig === 'function' ? getConfig() : {};
+    if (provider || providerError) return provider;
     try {
       provider = registry.loadProvider(cfg.provider || 'mock');
     } catch (err) {
-      console.warn('[mochi] failed to load provider:', err);
+      providerError = err;
+      setStatus(`provider error: ${err && err.message ? err.message : err}`);
     }
+    updateStatusLine();
     return provider;
   }
 
-  function appendMessage(role, content) {
-    const el = document.createElement('div');
-    el.className = `mochi-msg mochi-msg-${role}`;
-    el.innerHTML = esc(content).replace(/\n/g, '<br>');
-    messagesEl.appendChild(el);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-    return el;
-  }
+  // getConfig may be sync or async (preload's is an ipc invoke → Promise).
+  Promise.resolve(typeof getConfig === 'function' ? getConfig() : {})
+    .then((c) => {
+      cfg = c || {};
+      ensureProvider();
+      updateStatusLine();
+    })
+    .catch((err) => {
+      providerError = err;
+      setStatus(`provider error: ${err && err.message ? err.message : err}`);
+    });
 
-  function renderHistory() {
-    messagesEl.innerHTML = '';
-    if (history.length === 0) {
-      const cfg = typeof getConfig === 'function' ? getConfig() : {};
-      const greeting = cfg.userName
-        ? `Woof, ${cfg.userName}! I'm Mochi. Click me or type below to chat!`
-        : "Woof! I'm Mochi, your desktop dog companion! What's on your mind?";
-      appendMessage('assistant', greeting);
-    } else {
-      for (const msg of history) {
-        appendMessage(msg.role, msg.content);
-      }
-    }
-  }
+  buildQuickActions();
+  history.forEach((m) =>
+    appendMessage(m.role, m.content, { save: false, markdown: m.role === 'assistant' })
+  );
+  updateStatusLine();
+  setAgentState(MochiState.IDLE);
 
-  function setStatus(text) {
-    if (statusLine) {
-      statusLine.textContent = text || '';
-    }
-  }
-
-  async function submitMessage(text) {
-    if (!text || busy) return;
-    const cleanText = text.trim();
-    if (!cleanText) return;
-
-    input.value = '';
-    busy = true;
-    form.querySelector('button[type="submit"]')?.setAttribute('disabled', 'true');
-
-    history.push({ role: 'user', content: cleanText });
-    saveHistory();
-    appendMessage('user', cleanText);
-
-    if (dog && typeof dog.setAgentState === 'function') {
-      dog.setAgentState(MochiState.THINKING);
-    }
-    setStatus('Mochi is thinking…');
-
-    const assistantMsgEl = appendMessage('assistant', '');
-    let assistantText = '';
-
-    controller = new AbortController();
-    const activeProvider = ensureProvider();
-    const cfg = typeof getConfig === 'function' ? getConfig() : {};
-
-    try {
-      if (!activeProvider) {
-        throw new Error('No provider available.');
-      }
-
-      for await (const event of activeProvider.send(
-        history,
-        {},
-        controller.signal,
-        { userName: cfg.userName }
-      )) {
-        if (!event) continue;
-
-        if (event.type === 'text-delta' && event.delta) {
-          assistantText += event.delta;
-          assistantMsgEl.innerHTML = esc(assistantText).replace(/\n/g, '<br>');
-          messagesEl.scrollTop = messagesEl.scrollHeight;
-        } else if (event.type === 'state') {
-          if (dog && typeof dog.setAgentState === 'function') {
-            dog.setAgentState(event.state);
-          }
-        } else if (event.type === 'error') {
-          assistantText += `\n[Error: ${event.message || 'Something went wrong.'}]`;
-          assistantMsgEl.innerHTML = esc(assistantText).replace(/\n/g, '<br>');
-          if (dog && typeof dog.setAgentState === 'function') {
-            dog.setAgentState(MochiState.ERROR);
-          }
+  if (stopBtn) {
+    stopBtn.addEventListener('click', () => {
+      if (controller) {
+        try {
+          controller.abort();
+        } catch {
+          /* noop */
         }
       }
-
-      if (assistantText.trim()) {
-        history.push({ role: 'assistant', content: assistantText.trim() });
-        saveHistory();
-      }
-
-      if (dog && typeof dog.setAgentState === 'function') {
-        dog.setAgentState(MochiState.DONE);
-      }
-      setStatus('');
-    } catch (err) {
-      if (!controller.signal.aborted) {
-        assistantMsgEl.innerHTML = esc(`Woof... error: ${err.message || err}`);
-        if (dog && typeof dog.setAgentState === 'function') {
-          dog.setAgentState(MochiState.ERROR);
-        }
-        setStatus('Error occurred');
-      }
-    } finally {
-      busy = false;
-      controller = null;
-      form.querySelector('button[type="submit"]')?.removeAttribute('disabled');
-      input.focus();
-    }
+    });
   }
+  if (regenBtn) regenBtn.addEventListener('click', regenerate);
+  if (exportBtn) exportBtn.addEventListener('click', exportConversation);
 
-  function notifyOpen(v) {
-    try { if (typeof bridge.setPanelOpen === 'function') bridge.setPanelOpen(v); } catch {}
-    try { window.dispatchEvent(new CustomEvent('mochi:panel', { detail: { open: v } })); } catch {}
+  if (bridge && typeof bridge.onTogglePanel === 'function') {
+    bridge.onTogglePanel(() => toggle());
   }
+  if (bridge && typeof bridge.onToolApprovalRequest === 'function') {
+    bridge.onToolApprovalRequest(handleMainApprovalRequest);
+  }
+  if (form) {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      send(input ? input.value : '');
+      if (input) input.value = '';
+    });
+  }
+  rootEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') close();
+  });
+
+  /* ---------- public API ---------- */
 
   function open() {
-    if (isOpen) return;
     isOpen = true;
-    notifyOpen(true);
-    rootEl.classList.remove('hidden');
-    rootEl.removeAttribute('hidden');
-    renderHistory();
-    if (typeof bridge.focusWindow === 'function') {
-      try { bridge.focusWindow(); } catch {}
-    }
-    if (typeof bridge.setIgnoreMouseEvents === 'function') {
-      try { bridge.setIgnoreMouseEvents(false); } catch {}
-    }
-    if (dog && typeof dog.setPanelOpen === 'function') {
-      dog.setPanelOpen(true);
-    }
-    setTimeout(() => input?.focus(), 50);
+    rootEl.hidden = false;
+    rootEl.classList.add('open');
+    if (bridge && typeof bridge.focusWindow === 'function') bridge.focusWindow();
+    if (input) input.focus();
   }
 
   function close() {
-    if (!isOpen) return;
     isOpen = false;
-    notifyOpen(false);
-    rootEl.classList.add('hidden');
-    rootEl.setAttribute('hidden', '');
+    rootEl.classList.remove('open');
+    rootEl.hidden = true;
     if (controller) {
-      controller.abort();
-      controller = null;
-    }
-    busy = false;
-    setStatus('');
-    if (dog && typeof dog.setPanelOpen === 'function') {
-      dog.setPanelOpen(false);
+      try {
+        controller.abort();
+      } catch {
+        /* noop */
+      }
     }
   }
 
@@ -216,41 +170,341 @@ export function createPanel(rootEl, deps = {}) {
     else open();
   }
 
-  // Event listeners
-  if (form) {
-    form.addEventListener('submit', (e) => {
-      e.preventDefault();
-      submitMessage(input.value);
+  /**
+   * Render an approval card for a main-initiated request and wire the
+   * decision back through bridge.respondApproval.
+   */
+  function pushApprovalRequest(req) {
+    renderApprovalCard(approvalArea, req, (approved) => {
+      if (bridge && typeof bridge.respondApproval === 'function') {
+        bridge.respondApproval(req && req.id, !!approved);
+      }
     });
   }
 
-  if (clearBtn) {
-    clearBtn.addEventListener('click', () => {
-      history = [];
-      try { localStorage.removeItem(HISTORY_KEY); } catch {}
-      renderHistory();
-    });
+  /* ---------- chat ---------- */
+
+  async function send(text) {
+    text = (text || '').trim();
+    if (!text) return;
+    if (busy) {
+      setStatus('Mochi is still working — one thing at a time!');
+      return;
+    }
+    const activeProvider = ensureProvider();
+    if (!activeProvider) {
+      appendMessage('assistant', 'No provider loaded. Check your mochi.config.json.', {
+        markdown: true,
+      });
+      return;
+    }
+    lastUserText = text;
+    setBusyUI(true);
+    appendMessage('user', text, { save: false });
+    pushHistory('user', text);
+    const streamBody = appendMessage('assistant', '', { stream: true });
+    let assistantText = '';
+
+    controller = new AbortController();
+    const tools = makeToolsAdapter();
+    setAgentState(MochiState.THINKING);
+
+    try {
+      const convo = history.slice(-PROVIDER_HISTORY).map((m) => ({ role: m.role, content: m.content }));
+      for await (const ev of activeProvider.send(convo, tools, controller.signal)) {
+        if (!ev || typeof ev !== 'object') continue;
+        switch (ev.type) {
+          case 'text-delta':
+            assistantText += esc(ev.delta || '');
+            streamBody.textContent = assistantText;
+            scrollBottom();
+            break;
+          case 'state':
+            setAgentState(ev.state);
+            break;
+          case 'tool-request':
+            appendToolNotice(ev);
+            break;
+          case 'tool-result':
+            appendToolResult(ev);
+            break;
+          case 'error':
+            assistantText += `\n⚠ ${ev.message || 'provider error'}`;
+            streamBody.textContent = assistantText;
+            setAgentState(MochiState.ERROR);
+            break;
+          case 'done':
+            break;
+          default:
+            break;
+        }
+      }
+      pushHistory('assistant', assistantText || '(no reply)');
+    } catch (err) {
+      const msg = err && err.name === 'AbortError' ? '(stopped)' : `⚠ ${err && err.message ? err.message : err}`;
+      assistantText += `\n${msg}`;
+      streamBody.textContent = assistantText;
+      pushHistory('assistant', assistantText);
+      setAgentState(MochiState.ERROR);
+    } finally {
+      // The stream body stayed plain text while streaming (partial markdown
+      // would flicker and break mid-fence); render the finished reply now.
+      renderAssistantMarkdown(streamBody, assistantText);
+      setBusyUI(false);
+      controller = null;
+      updateStatusLine();
+      scrollBottom();
+    }
   }
 
-  if (closeBtn) {
-    closeBtn.addEventListener('click', () => {
-      close();
-    });
+  function makeToolsAdapter() {
+    return {
+      invokeTool: (name, args) => bridge.invokeTool(name, args || {}),
+      requestApproval: (info) =>
+        new Promise((resolve) => {
+          renderApprovalCard(approvalArea, info, (approved) => {
+            if (approved) preApproved.set(approvalKey(info.tool, info.args), Date.now());
+            resolve(approved);
+          });
+        }),
+    };
   }
 
-  // Intercept bridge toggle-panel signal
-  if (typeof bridge.onTogglePanel === 'function') {
-    bridge.onTogglePanel(() => toggle());
+  /** Main challenged us for a write/shell tool invoked through the bridge. */
+  function handleMainApprovalRequest(req) {
+    if (!req) return;
+    const key = approvalKey(req.tool, req.args);
+    const ts = preApproved.get(key);
+    if (ts && Date.now() - ts < PRE_APPROVAL_TTL_MS) {
+      // The user already approved this exact call in-panel (e.g. mock demo
+      // flow): answer the main challenge without prompting twice.
+      preApproved.delete(key);
+      if (bridge && typeof bridge.respondApproval === 'function') {
+        bridge.respondApproval(req.id, true);
+      }
+      return;
+    }
+    pushApprovalRequest(req);
   }
 
-  return {
-    open,
-    close,
-    toggle,
-    isOpen: () => isOpen,
-    destroy() {
-      close();
-      if (controller) controller.abort();
-    },
-  };
+  /* ---------- rendering helpers ---------- */
+
+  function appendMessage(role, text, opts) {
+    const save = !opts || opts.save !== false;
+    const wrap = document.createElement('div');
+    wrap.className = `mochi-msg mochi-msg-${role}`;
+    const body = document.createElement('div');
+    body.className = 'mochi-msg-body';
+    if (opts && opts.markdown && role === 'assistant') {
+      renderAssistantMarkdown(body, text);
+    } else {
+      body.style.whiteSpace = 'pre-wrap';
+      body.style.wordBreak = 'break-word';
+      body.textContent = esc(text);
+    }
+    wrap.appendChild(body);
+    if (messagesEl) messagesEl.appendChild(wrap);
+    scrollBottom();
+    if (save && !(opts && opts.stream)) pushHistory(role, text);
+    return body;
+  }
+
+  /**
+   * Swap a message body to its finished markdown rendering and wire the
+   * copy buttons on any code blocks it contains.
+   */
+  function renderAssistantMarkdown(body, text) {
+    body.classList.add('mochi-md');
+    body.style.whiteSpace = 'normal';
+    body.style.wordBreak = 'normal';
+    body.innerHTML = renderMarkdown(text);
+    attachCopyButtons(body);
+  }
+
+  /**
+   * Regenerate: drop the latest assistant turn (bubble + history) and
+   * re-send the last user message, so the fresh reply replaces the old one
+   * instead of stacking a second answer.
+   */
+  function regenerate() {
+    if (busy) {
+      setStatus('Mochi is still working — one thing at a time!');
+      return;
+    }
+    if (!lastUserText) {
+      setStatus('Nothing to regenerate yet — say something first.');
+      return;
+    }
+    while (history.length && history[history.length - 1].role === 'assistant') history.pop();
+    saveHistory();
+    if (messagesEl) {
+      const bubbles = messagesEl.querySelectorAll('.mochi-msg-assistant');
+      const last = bubbles[bubbles.length - 1];
+      if (last) last.remove();
+    }
+    send(lastUserText);
+  }
+
+  /** Download the visible conversation as a Markdown file. */
+  function exportConversation() {
+    const stamp = new Date();
+    const pad = (v) => String(v).padStart(2, '0');
+    const fname =
+      `mochi-chat-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}` +
+      `-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.md`;
+    const pid = provider ? provider.id : cfg.provider || 'mock';
+    const lines = [
+      '# Mochi chat export',
+      '',
+      `_Exported ${stamp.toLocaleString()} · provider: ${pid}_`,
+      '',
+    ];
+    for (const m of history) {
+      lines.push(m.role === 'user' ? '## You' : '## Mochi', '', String(m.content), '');
+    }
+    // Tool outputs rendered this session (full text, kept in memory by
+    // toolResults.js — truncation never destroys it).
+    const toolOutputs = getToolExport();
+    if (toolOutputs.length) {
+      lines.push('## Tool outputs', '');
+      for (const t of toolOutputs) {
+        lines.push(`### ${t.ok ? '✓' : '✗'} ${t.id}`, '', '```text', String(t.text), '```', '');
+      }
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+      a.remove();
+    }, 1500);
+    setStatus(`Exported ${history.length} messages → ${fname}`);
+    setTimeout(() => updateStatusLine(), 3000);
+  }
+
+  function appendToolNotice(ev) {
+    const auto = READ_ONLY_TOOLS.has(ev.tool);
+    const line = auto
+      ? `⚙ ${ev.tool} — read-only, running…`
+      : `⚙ ${ev.tool} — needs your approval…`;
+    const el = document.createElement('div');
+    el.className = 'mochi-msg mochi-tool-notice';
+    el.textContent = line;
+    el.style.fontSize = '11px';
+    el.style.opacity = '0.85';
+    if (messagesEl) messagesEl.appendChild(el);
+    scrollBottom();
+  }
+
+  function appendToolResult(ev) {
+    // Rich rendering (src/renderer/toolResults.js): collapsible diffs with
+    // per-file sections, truncation with show more/less, copy button. The
+    // full output stays in memory for copy/export; only the visible slice
+    // is truncated.
+    const el = document.createElement('div');
+    el.className = 'mochi-msg mochi-tool-result';
+    try {
+      el.appendChild(createToolResultElement(ev || {}));
+    } catch {
+      el.textContent = (ev && ev.ok ? `✓ ${ev.id || 'tool'} ok` : `✗ ${(ev && ev.id) || 'tool'} failed${ev && ev.error ? `: ${ev.error}` : ''}`);
+      el.style.fontSize = '11px';
+      el.style.opacity = '0.85';
+    }
+    if (messagesEl) messagesEl.appendChild(el);
+    scrollBottom();
+  }
+
+  function setAgentState(state) {
+    try {
+      if (dog && typeof dog.setAgentState === 'function') dog.setAgentState(state);
+    } catch {
+      /* dog animations are best-effort */
+    }
+    if (badge) {
+      const label =
+        state === MochiState.THINKING
+          ? '💭 thinking'
+          : state === MochiState.WORKING
+            ? '⚙ working'
+            : state === MochiState.NEEDS_APPROVAL
+              ? '⚠ needs approval'
+              : state === MochiState.DONE
+                ? '✓ done'
+                : state === MochiState.ERROR
+                  ? '✗ error'
+                  : '🐶 idle';
+      badge.textContent = label;
+    }
+    updateStatusLine(state);
+  }
+
+  function setStatus(text) {
+    if (statusLine) statusLine.textContent = text;
+  }
+
+  function updateStatusLine(state) {
+    const pid = provider ? provider.id : cfg.provider || 'mock';
+    const folder = cfg.root || cfg.workingFolder || 'repo';
+    const busyNote = state && isAgentBusy(state) ? ` · ${state}…` : '';
+    setStatus(`provider: ${pid} (not connected) · folder: ${folder}${busyNote}`);
+  }
+
+  function setBusyUI(on) {
+    busy = on;
+    if (input) input.disabled = on;
+    const sendBtn = form ? form.querySelector('button[type="submit"]') : null;
+    if (sendBtn) sendBtn.disabled = on;
+    if (stopBtn) stopBtn.disabled = !on;
+  }
+
+  function scrollBottom() {
+    if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  function buildQuickActions() {
+    if (!quickRow) return;
+    quickRow.innerHTML = '';
+    for (const label of QUICK_ACTIONS) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mochi-quick-action';
+      btn.textContent = label;
+      btn.addEventListener('click', () => send(label));
+      quickRow.appendChild(btn);
+    }
+  }
+
+  /* ---------- history ---------- */
+
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr)
+        ? arr.filter((m) => m && typeof m.content === 'string').slice(-HISTORY_CAP)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function pushHistory(role, content) {
+    history.push({ role, content: String(content) });
+    if (history.length > HISTORY_CAP) history = history.slice(-HISTORY_CAP);
+    saveHistory();
+  }
+
+  function saveHistory() {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch {
+      /* storage full / unavailable — chat still works */
+    }
+  }
+
+  return { open, close, toggle, isOpen: () => isOpen, pushApprovalRequest };
 }
