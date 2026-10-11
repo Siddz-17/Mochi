@@ -1,5 +1,5 @@
 {
-  "provider": "mock",
+  "provider": "groq",
   "scale": 4,
   "userName": "",
   "wanderEnabled": true,

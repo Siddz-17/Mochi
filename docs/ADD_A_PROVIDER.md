@@ -1,16 +1,19 @@
 # Adding an AI Provider to Mochi
 
-> 🔌 **Status: NOT CONNECTED YET.** Mochi currently runs on the local
-> `mock` provider only. The steps below describe exactly how a real
-> provider gets plugged in later. No external AI provider code ships with this build.
+> 🔌 **Status: CONNECTED.** Mochi ships with the local `mock`
+> provider and a `groq` provider for the Groq API. Set `"provider": "groq"`
+> in `mochi.config.json` and export `GROQ_API_KEY` (free at
+> https://console.groq.com) to go live. The steps below also cover
+> how a further provider gets plugged in.
 
 ## The Contract
 
 Every provider implements the `AgentProvider` interface defined in
 `src/provider/interface.js` — plain ES modules, no build step. `send` is an
 async generator so the chat panel can render the conversation event-by-event.
-(The only bundled provider is the offline `MockProvider` in
-`src/provider/mock.js` — read it as the reference implementation.)
+(Bundled providers: the offline `MockProvider` in `src/provider/mock.js`
+— read it as the reference implementation — and `GroqProvider` in
+`src/provider/groq.js`.)
 
 ```js
 /**
