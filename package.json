@@ -34,9 +34,9 @@
     }
   },
   "dependencies": {
-    "electron-updater": "^6.8.9"
+    "electron-updater": "^6.8.11"
   },
-  "description": "Mochi \u2014 a pixel-dog desktop companion that lives on your screen.",
+  "description": "Mochi — a pixel-dog desktop companion that lives on your screen.",
   "devDependencies": {
     "electron": "^44.7.0",
     "electron-builder": "^26.15.3"
